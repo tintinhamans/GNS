@@ -1211,7 +1211,11 @@ CSteamNetworkingICESession::CSteamNetworkingICESession( const ICESessionConfig& 
 			{
 				netadr_t adr;
 				SteamNetworkingIPAddrToNetAdr( adr, ip );
-				m_vecSTUNServers.push_back( adr );
+
+				// Skip duplicates.  Failover finds the current server by address,
+				// so a repeated address would make it retry the same entry forever.
+				if ( index_of( m_vecSTUNServers, adr ) < 0 )
+					m_vecSTUNServers.push_back( adr );
 			}
 		}
 	}

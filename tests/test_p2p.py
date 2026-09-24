@@ -446,6 +446,15 @@ FAILURE_TEST_CASES = [
             },
             expected_candidates=( {'host': 1}, {'host': 1} ) ) ),
 
+    # Same as above, but the dead STUN server is listed twice (like several hostnames
+    # resolving to one IP).  Failover must not keep retrying the same server.
+    ( 'STUN unavailable, duplicate server entries',
+      _nat( _SRV_INT, _SRV_GW, 'full-cone' ),
+      _nat( _CLI_INT, _CLI_GW, 'full-cone' ),
+      dict( stun='%s,%s' % ( _DEAD_SERVER, _DEAD_SERVER ), turn=None,
+            expected_counters={ 'binding_req_retx': (4, 4) },
+            expected_candidates=( {'host': 1}, {'host': 1} ) ) ),
+
     # TURN not configured: symmetric NAT requires relay; without it the connection must fail.
     # Connectivity checks to srflx candidates retransmit 4 times before giving up.
     ( 'TURN not configured (symmetric NAT)',
