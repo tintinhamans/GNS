@@ -130,7 +130,7 @@ namespace SteamNetworkingSocketsLib {
         void QueueBindRequest( const netadr_t &addrSTUNServer, RecvSTUNPacketCallback_t cb, int nEncoding );
 
         // Send a TURN Allocate request
-        void QueueAllocateRequest( const netadr_t &addrTURNServer, RecvSTUNPacketCallback_t cb, int nEncoding );
+        void QueueAllocateRequest( int nTURNServerIdx, RecvSTUNPacketCallback_t cb, int nEncoding );
 
         // Send a TURN Refresh request to keep the allocation alive
         void QueueRefreshRequest( RecvSTUNPacketCallback_t cb, int nEncoding );
@@ -249,6 +249,10 @@ namespace SteamNetworkingSocketsLib {
         // For TURN CreatePermission requests, the revision number of our permissions list in this request.
         // Not used for other request types
         int m_nTURNPermissionRevision;
+
+        // For srflx discovery and TURN Allocate requests, the index of the server in the
+        // session's STUN or TURN server list.  Used to fail over to the next entry.
+        int m_nServerIdx = 0;
 
         // Serialize the packet and start the retry loop.
         void Queue( uint32 nMessageType, int nEncoding, netadr_t remoteAddr, RecvSTUNPacketCallback_t cb, STUNAttribute *pExtraAttrs = nullptr, int nExtraAttrs = 0 );
