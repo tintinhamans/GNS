@@ -1259,12 +1259,16 @@ void CSteamNetworkingICESession::AddServers( std_vector< ICEServerEntry > &vecEn
 	{
 		for ( const netadr_t &adr : entry.m_vecAddrs )
 		{
+			// Skip duplicates, retrying the same address is pointless.
 			if ( !entry.m_bIsTURN )
 			{
-				m_vecSTUNServers.push_back( adr );
+				if ( index_of( m_vecSTUNServers, adr ) < 0 )
+					m_vecSTUNServers.push_back( adr );
 				continue;
 			}
 
+			if ( index_of( m_vecTURNServers, adr ) >= 0 )
+				continue;
 			m_vecTURNServers.push_back( adr );
 			TURNCredentials cred;
 			cred.m_strUsername = entry.m_strUsername;
