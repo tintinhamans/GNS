@@ -2330,9 +2330,9 @@ void CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveKeepAlive( c
     if ( m_vecSTUNServers.empty() )
         return;
 
-    const int nSTUNServerIdx = std::max( 0, index_of( m_vecSTUNServers, info.m_pRequest->m_remoteAddr ) );
-    const int nNextSTUNServerIdx = ( nSTUNServerIdx + 1 ) % len( m_vecSTUNServers );
+    const int nNextSTUNServerIdx = ( info.m_pRequest->m_nServerIdx + 1 ) % len( m_vecSTUNServers );
     pIntf->QueueBindRequest( m_vecSTUNServers[ nNextSTUNServerIdx ], &CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveKeepAlive, m_nEncoding );
+    pIntf->m_pPendingSTUNRequest->m_nServerIdx = nNextSTUNServerIdx;
 }
 
 void CSteamNetworkingICESession::UpdateKeepalive( ICESessionInterface *pIntf )
@@ -2343,6 +2343,7 @@ void CSteamNetworkingICESession::UpdateKeepalive( ICESessionInterface *pIntf )
         return;
 
     pIntf->QueueBindRequest( pIntf->m_addrSTUNServer, &CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveKeepAlive, m_nEncoding );
+    pIntf->m_pPendingSTUNRequest->m_nServerIdx = std::max( 0, index_of( m_vecSTUNServers, pIntf->m_addrSTUNServer ) );
 }
 
 void CSteamNetworkingICESession::Think_KeepAliveOnCandidates( SteamNetworkingMicroseconds usecNow )

@@ -250,7 +250,7 @@ namespace SteamNetworkingSocketsLib {
         // Not used for other request types
         int m_nTURNPermissionRevision;
 
-        // For srflx discovery and TURN Allocate requests, the index of the server in the
+        // For STUN binding and TURN Allocate requests, the index of the server in the
         // session's STUN or TURN server list.  Used to fail over to the next entry.
         int m_nServerIdx = 0;
 
