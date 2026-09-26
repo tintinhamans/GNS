@@ -161,14 +161,15 @@ namespace SteamNetworkingSocketsLib {
         // Send a STUN binding request for keepalive (single in-flight request per interface).
         void QueueBindRequest( const netadr_t &addrSTUNServer, RecvSTUNPacketCallback_t cb, int nEncoding );
 
-        // Send (or re-send after a 401 challenge) a TURN Allocate request for concurrent
+        // Send (or re-send after an auth challenge) a TURN Allocate request for concurrent
         // relay discovery, tracked in m_vecPendingAllocateRequests.  pRealm/pNonce/pKey carry
         // long-term-credential state for this specific server if a prior challenge already
-        // primed them; null for a first attempt.
-        void QueueAllocateDiscoveryRequest( int nTURNServerIdx, const std::string *pRealm, const std::string *pNonce, const uint8 *pKey );
+        // primed them; null for a first attempt.  nAuthRetriesUsed bounds the challenge/retry
+        // loop against a misbehaving server.
+        void QueueAllocateDiscoveryRequest( int nTURNServerIdx, const std::string *pRealm, const std::string *pNonce, const uint8 *pKey, int nAuthRetriesUsed = 0 );
 
         // Send a TURN Refresh request to keep the allocation alive.
-        void QueueRefreshRequest( RecvSTUNPacketCallback_t cb, int nEncoding );
+        void QueueRefreshRequest( RecvSTUNPacketCallback_t cb, int nEncoding, int nAuthRetriesUsed = 0 );
 
         // Fire-and-forget release of a relay allocation this interface no longer needs (a
         // losing racer from concurrent Allocate discovery that still completed after another
@@ -255,6 +256,9 @@ namespace SteamNetworkingSocketsLib {
     const uint32 k_nTURN_Attr_XORRelayedAddress  = 0x0016;
     const uint32 k_nTURN_Attr_RequestedTransport = 0x0019;
 
+    // STUN/TURN error codes we act on (RFC 5389 sec 15.6, RFC 5766 sec 10).
+    const int k_nTURNErrorCode_Unauthorized = 401; // no (or wrong) long-term credentials
+    const int k_nTURNErrorCode_StaleNonce   = 438; // credentials were fine, but the nonce expired
 
     enum STUNPacketEncodingFlags
     {
@@ -296,12 +300,17 @@ namespace SteamNetworkingSocketsLib {
         int m_nServerIdx = 0;
 
         // For TURN Allocate discovery requests only: the long-term-credential state this
-        // specific request used (if any), captured from that server's 401 challenge.
+        // specific request used (if any), captured from that server's 401/438 challenge.
         // Carried onto the winning interface's persistent fields on success so
         // Think_TURNMaintenance can keep authenticating to the same server afterward.
         std::string m_strTURNRealm;
         std::string m_strTURNNonce;
         uint8 m_arrTURNKey[16] = {};
+
+        // How many times this logical TURN operation has already been retried after an
+        // auth challenge (401 or 438).  Carried forward into each retry's replacement
+        // request and capped to stop a misbehaving server from looping us forever.
+        int m_nAuthRetriesUsed = 0;
 
         // Serialize the packet and start the retry loop.
         void Queue( uint32 nMessageType, int nEncoding, netadr_t remoteAddr, RecvSTUNPacketCallback_t cb, STUNAttribute *pExtraAttrs = nullptr, int nExtraAttrs = 0 );
