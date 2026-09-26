@@ -39,6 +39,7 @@ constexpr int k_nICECloseCode_Local_NotCompiled = k_ESteamNetConnectionEnd_Local
 constexpr int k_nICECloseCode_Local_UserNotEnabled = k_ESteamNetConnectionEnd_Local_Max-1;
 constexpr int k_nICECloseCode_Local_Special = k_ESteamNetConnectionEnd_Local_Max-2; // Not enabled because we are forcing a particular transport that isn't ICE
 constexpr int k_nICECloseCode_Aborted = k_ESteamNetConnectionEnd_Local_Max-2;
+constexpr int k_nICECloseCode_Local_AllCandidatesFailed = k_ESteamNetConnectionEnd_Local_Max-3; // every local x remote candidate pair failed; no point waiting out the full connect timeout
 constexpr int k_nICECloseCode_Remote_NotEnabled = k_ESteamNetConnectionEnd_Remote_Max;
 
 // For some types of connections we send actual message data in the signals.
