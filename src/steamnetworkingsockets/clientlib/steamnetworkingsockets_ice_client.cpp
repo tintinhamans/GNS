@@ -1538,6 +1538,10 @@ EICECandidateType CSteamNetworkingICESession::AddPeerCandidate( const RFC5245Can
 {
 	SteamNetworkingGlobalLock::AssertHeldByCurrentThread();
 
+    // A new candidate might still turn into a working pair -- reset the "all candidates
+    // failed" grace period so Think_CheckAllCandidatesFailed gives it a chance.
+    m_usecLastPeerCandidateActivity = SteamNetworkingSockets_GetLocalTimestamp();
+
     ICECandidateBase candidate( attr.nType, attr.address );
     candidate.m_nPriority = attr.nPriority;
     const char *pszFoundation = attr.sFoundation.c_str();
@@ -1686,6 +1690,8 @@ void CSteamNetworkingICESession::StartSession()
 {
     m_nextKeepalive = 0;
     m_pSelectedCandidatePair = nullptr;
+    m_usecLastPeerCandidateActivity = SteamNetworkingSockets_GetLocalTimestamp();
+    m_bAllCandidatesFailedNotified = false;
     CCrypto::GenerateRandomBlock( &m_nRoleTiebreaker, sizeof( m_nRoleTiebreaker ) );
     SetNextThinkTimeASAP();
 }
@@ -2191,6 +2197,74 @@ void CSteamNetworkingICESession::Think( SteamNetworkingMicroseconds usecNow )
     // we'd send unauthenticated requests and couldn't verify the response integrity.
     if ( !m_vecPeerCandidates.empty() && !m_strRemotePassword.empty() )
         Think_TestPeerConnectivity();
+
+    Think_CheckAllCandidatesFailed( usecNow );
+}
+
+// See declaration comment.  Conservative by construction: every early-out below returns
+// false (not yet exhausted), so a slow signal or a still-racing discovery request can never
+// be mistaken for total failure.
+bool CSteamNetworkingICESession::BAllCandidatesExhausted( SteamNetworkingMicroseconds usecNow ) const
+{
+    // More STUN/TURN servers could still show up from a slow DNS lookup.
+    if ( m_pDNSResolveState )
+        return false;
+
+    // No usable local adapter found (yet)?  Not a terminal state here -- GatherInterfaces
+    // keeps retrying, and true "no adapters at all" is reported through other means.
+    if ( m_vecInterfaces.empty() )
+        return false;
+
+    for ( const std::unique_ptr<ICESessionInterface> &pIntf : m_vecInterfaces )
+    {
+        if ( ( m_nPermittedCandidateTypes & k_EICECandidate_Any_Reflexive ) && !m_vecSTUNServers.empty() )
+        {
+            bool bDone      = pIntf->m_addrSTUNServer.IsValid() && !pIntf->m_bServerReflexiveFailed;
+            bool bExhausted = pIntf->m_bServerReflexiveFailed && pIntf->m_nSTUNServersDispatched >= len( m_vecSTUNServers );
+            if ( !bDone && !bExhausted )
+                return false;
+        }
+        if ( ( m_nPermittedCandidateTypes & k_EICECandidate_Any_Relay ) && !m_vecTURNServers.empty() )
+        {
+            bool bDone      = pIntf->m_addrTURNServer.IsValid() && !pIntf->m_bRelayFailed;
+            bool bExhausted = pIntf->m_bRelayFailed && pIntf->m_nTURNServersDispatched >= len( m_vecTURNServers );
+            if ( !bDone && !bExhausted )
+                return false;
+        }
+    }
+
+    // Haven't even gotten the peer's password yet -- we're waiting on signaling, not failed.
+    if ( m_strRemotePassword.empty() )
+        return false;
+
+    // Any pair not yet in a terminal Failed state (Succeeded, InProgress, Waiting, or Frozen)
+    // means there's still something to check.
+    for ( ICECandidatePair *pPair : m_vecCandidatePairs )
+    {
+        if ( pPair->m_nState != kICECandidatePairState_Failed )
+            return false;
+    }
+
+    // Give a slow signaling round-trip (or the very first candidate) a grace period before
+    // concluding nothing more is coming.  This also covers the "no pairs at all yet" case,
+    // since m_usecLastPeerCandidateActivity starts at session start.
+    const SteamNetworkingMicroseconds k_usecAllCandidatesFailedGracePeriod = 2 * k_nMillion;
+    if ( usecNow < m_usecLastPeerCandidateActivity + k_usecAllCandidatesFailedGracePeriod )
+        return false;
+
+    return true;
+}
+
+void CSteamNetworkingICESession::Think_CheckAllCandidatesFailed( SteamNetworkingMicroseconds usecNow )
+{
+    if ( m_bAllCandidatesFailedNotified )
+        return;
+    if ( !BAllCandidatesExhausted( usecNow ) )
+        return;
+
+    m_bAllCandidatesFailedNotified = true;
+    if ( m_pCallbacks )
+        m_pCallbacks->OnAllCandidatesFailed();
 }
 
 void CSteamNetworkingICESession::Think_DiscoverServerReflexiveCandidates()
@@ -3226,6 +3300,12 @@ void CConnectionTransportP2PICE_Valve::OnPacketReceived( const RecvPktInfo_t &in
 {
     ConnectionScopeLock lock( Connection(), "CConnectionTransportP2PICE_Valve::OnPacketReceived");
     ProcessPacket( (const uint8_t*)info.m_pPkt, info.m_cbPkt, info.m_usecNow );
+}
+
+void CConnectionTransportP2PICE_Valve::OnAllCandidatesFailed()
+{
+    ConnectionScopeLock lock( Connection(), "CConnectionTransportP2PICE_Valve::OnAllCandidatesFailed");
+    Connection().ICEFailed( k_nICECloseCode_Local_AllCandidatesFailed, "ICE: all candidate pairs failed" );
 }
 
 } // namespace SteamNetworkingSocketsLib

@@ -1016,6 +1016,21 @@ void CSteamNetworkConnectionP2P::ThinkConnection( SteamNetworkingMicroseconds us
 
 	CheckCleanupICE();
 
+	#ifdef STEAMNETWORKINGSOCKETS_ENABLE_ICE
+		// ICE just failed (e.g. every candidate pair was tried and failed) and
+		// CheckCleanupICE just tore down the transport above.  If nothing else is
+		// available and we're still trying to connect, don't wait out the rest of
+		// TimeoutInitial -- fail now with the specific reason we recorded.
+		if (
+			m_vecAvailableTransports.empty() && m_pTransport == nullptr
+			&& m_msgICESessionSummary.has_local_candidate_types() && GetICEFailureCode() != 0
+			&& ( GetState() == k_ESteamNetworkingConnectionState_Connecting || GetState() == k_ESteamNetworkingConnectionState_FindingRoute )
+		) {
+			ConnectionState_ProblemDetectedLocally( (ESteamNetConnectionEnd)GetICEFailureCode(), "%s", m_szICECloseMsg );
+			return;
+		}
+	#endif
+
 	// Process route selection if we're ready
 	if ( GetState() != k_ESteamNetworkingConnectionState_Connecting )
 	{
