@@ -2397,10 +2397,12 @@ void CSteamNetworkingICESession::STUNRequestCallback_RefreshAllocation( const Re
         // Else: a non-recoverable error response.  Fall through to teardown below.
     }
 
-    // Timed out, or a non-recoverable error -- the allocation is gone.  Tear down relay
-    // state so Think_DiscoverRelayCandidate will re-allocate, and remove all candidate
-    // pairs that depended on this relay.
-    SpewMsg( "ICE: TURN Refresh failed for %s -- tearing down relay allocation\n",
+    // Timed out, or a non-recoverable error -- the kept allocation is lost.  Fail over:
+    // tear down relay state and remove all candidate pairs that depended on it (this only
+    // touches relay pairs on this interface; a selected direct/srflx pair elsewhere is
+    // untouched), then let Think_DiscoverRelayCandidate re-race every TURN server of our
+    // family and advertise whatever new relay candidate wins, same as initial discovery.
+    SpewMsg( "ICE: TURN Refresh failed for %s -- failing over to another TURN server\n",
         CUtlNetAdrRender( pIntf->m_addrTURNServer ).String() );
 
     for ( int j = len( m_vecCandidatePairs ) - 1; j >= 0; --j )
@@ -2417,11 +2419,11 @@ void CSteamNetworkingICESession::STUNRequestCallback_RefreshAllocation( const Re
     pIntf->m_addrTURNServer.Clear();   // clears "discovery done" signal; re-allocation starts next tick
     pIntf->m_usecRefreshAfter  = 0;
     pIntf->m_nTURNPermissionRevision = 0;
-    // Re-race every TURN server of our family, not just resume where discovery left off --
-    // otherwise Think_DiscoverRelayCandidate's "already dispatched everything" check would
-    // consider this interface exhausted and never re-allocate.
-    pIntf->m_nTURNServersDispatched = 0;
-    // Leave m_bRelayFailed = false so Think_DiscoverRelayCandidate retries.
+    pIntf->m_strTURNRealm.clear();     // stale credentials for the lost server; discovery
+    pIntf->m_strTURNNonce.clear();     // re-authenticates from scratch with whichever
+    V_memset( pIntf->m_arrTURNKey, 0, sizeof( pIntf->m_arrTURNKey ) ); // server wins next
+    pIntf->m_nTURNServersDispatched = 0; // re-race all servers, not just resume past the old one
+    // Leave m_bRelayFailed = false so Think_DiscoverRelayCandidate retries right away.
 }
 
 void CSteamNetworkingICESession::Think_TURNMaintenance( SteamNetworkingMicroseconds usecNow )
