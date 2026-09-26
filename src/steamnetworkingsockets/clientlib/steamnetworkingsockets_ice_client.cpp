@@ -347,6 +347,37 @@ static const STUNAttribute* FindAttributeOfType( const STUNAttribute *pAttrs, ui
     return nullptr;
 }
 
+// Decode a STUN ERROR-CODE attribute's numeric class+number into a plain int (e.g. 438).
+// Returns 0 (not a valid STUN error code) if pErrorAttr is null or too short.
+static int GetSTUNErrorCode( const STUNAttribute *pErrorAttr )
+{
+    if ( pErrorAttr == nullptr || pErrorAttr->m_nLength < 4 )
+        return 0;
+    const uint8 *pErrBytes = reinterpret_cast<const uint8*>( pErrorAttr->m_pData );
+    return pErrBytes[2] * 100 + pErrBytes[3];
+}
+
+// Extract REALM/NONCE from a TURN 401 or 438 challenge response and recompute the
+// long-term-credential key (RFC 5766 sec 10: MD5(username:realm:password)).  strRealmInOut
+// carries in any realm we already have (so a 438 that omits REALM keeps using it) and is
+// updated if the response includes one.  Returns false if no usable realm/nonce is available.
+static bool ExtractTURNChallenge( const RecvSTUNPktInfo_t &info, const std::string &strUsername, const std::string &strPassword,
+    std::string &strRealmInOut, std::string &strNonceOut, uint8 arrKeyOut[16] )
+{
+    const STUNAttribute *pNonceAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nSTUN_Attr_Nonce );
+    if ( pNonceAttr == nullptr )
+        return false;
+    const STUNAttribute *pRealmAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nSTUN_Attr_Realm );
+    if ( pRealmAttr != nullptr )
+        strRealmInOut.assign( reinterpret_cast<const char*>( pRealmAttr->m_pData ), pRealmAttr->m_nLength );
+    if ( strRealmInOut.empty() )
+        return false;
+    strNonceOut.assign( reinterpret_cast<const char*>( pNonceAttr->m_pData ), pNonceAttr->m_nLength );
+    std::string strKeyInput = strUsername + ":" + strRealmInOut + ":" + strPassword;
+    CCrypto::GenerateMD5Digest( strKeyInput.c_str(), strKeyInput.size(), (MD5Digest_t*)arrKeyOut );
+    return true;
+}
+
 static uint32* ReserveFingerprintAttribute( uint32 *pBuffer )
 {
     pBuffer[0] = htonl( ( k_nSTUN_Attr_Fingerprint << 16 ) | 4 );
@@ -1092,7 +1123,7 @@ bool ICESessionInterface::QueueTURNRequest( uint32 nMsgType, int nEncoding, cons
     return true;
 }
 
-void ICESessionInterface::QueueAllocateDiscoveryRequest( int nTURNServerIdx, const std::string *pRealm, const std::string *pNonce, const uint8 *pKey )
+void ICESessionInterface::QueueAllocateDiscoveryRequest( int nTURNServerIdx, const std::string *pRealm, const std::string *pNonce, const uint8 *pKey, int nAuthRetriesUsed )
 {
     // REQUESTED-TRANSPORT: UDP (IANA protocol 17), protocol byte + 3 RFFU bytes
     uint32 uTransport = htonl( 17u << 24 );
@@ -1103,6 +1134,7 @@ void ICESessionInterface::QueueAllocateDiscoveryRequest( int nTURNServerIdx, con
 
     auto *pRequest = new CSteamNetworkingSocketsSTUNRequest( this );
     pRequest->m_nServerIdx = nTURNServerIdx;
+    pRequest->m_nAuthRetriesUsed = nAuthRetriesUsed;
     m_vecPendingAllocateRequests.push_back( pRequest );
 
     const netadr_t &addrTURNServer = m_session.m_vecTURNServers[ nTURNServerIdx ];
@@ -1164,11 +1196,12 @@ void ICESessionInterface::ReleaseTURNAllocation( const netadr_t &addrTURNServer,
     pRequest->Queue( k_nTURN_RefreshRequest, nEncoding, addrTURNServer, nullptr, attrs, nAttrs );
 }
 
-void ICESessionInterface::QueueRefreshRequest( RecvSTUNPacketCallback_t cb, int nEncoding )
+void ICESessionInterface::QueueRefreshRequest( RecvSTUNPacketCallback_t cb, int nEncoding, int nAuthRetriesUsed )
 {
     Assert( m_addrTURNServer.IsValid() );
 
-    QueueTURNRequest( k_nTURN_RefreshRequest, nEncoding, m_addrTURNServer, cb, nullptr, 0, m_pPendingSTUNRequest );
+    if ( QueueTURNRequest( k_nTURN_RefreshRequest, nEncoding, m_addrTURNServer, cb, nullptr, 0, m_pPendingSTUNRequest ) )
+        m_pPendingSTUNRequest->m_nAuthRetriesUsed = nAuthRetriesUsed;
 }
 
 // Send a gathered packet to the pair, routing via TURN Send Indication if the
@@ -2272,38 +2305,30 @@ void CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay( const RecvST
             }
         }
 
-        // Check for a 401 Unauthorized challenge -- the server requires long-term credentials.
-        // Only attempt auth once per server; a repeat 401 after that means wrong credentials.
+        // Auth challenge -- 401 the first time we present no credentials, 438 if our nonce
+        // went stale after we did.  Both mean: fetch a fresh nonce and retry once.
         const STUNAttribute *pErrorAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nSTUN_Attr_ErrorCode );
-        if ( !bAlreadyWon && pErrorAttr != nullptr && pErrorAttr->m_nLength >= 4
-            && info.m_pRequest->m_strTURNRealm.empty()
+        const int nErrorCode = GetSTUNErrorCode( pErrorAttr );
+        if ( !bAlreadyWon
+            && ( nErrorCode == k_nTURNErrorCode_Unauthorized || nErrorCode == k_nTURNErrorCode_StaleNonce )
+            && info.m_pRequest->m_nAuthRetriesUsed < 2
             && nSrvIdx >= 0 && nSrvIdx < len( m_vecTURNCredentials ) )
         {
-            const uint8 *pErrBytes = reinterpret_cast<const uint8*>( pErrorAttr->m_pData );
-            int nErrorCode = pErrBytes[2] * 100 + pErrBytes[3];
-            if ( nErrorCode == 401 )
+            const TURNCredentials &cred = m_vecTURNCredentials[ nSrvIdx ];
+            if ( !cred.m_strUsername.empty() )
             {
-                const STUNAttribute *pRealmAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nSTUN_Attr_Realm );
-                const STUNAttribute *pNonceAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nSTUN_Attr_Nonce );
-                if ( pRealmAttr && pNonceAttr )
+                std::string strRealm = info.m_pRequest->m_strTURNRealm; // carries forward on a 438 retry
+                std::string strNonce;
+                uint8 arrKey[16];
+                if ( ExtractTURNChallenge( info, cred.m_strUsername, cred.m_strPassword, strRealm, strNonce, arrKey ) )
                 {
-                    const TURNCredentials &cred = m_vecTURNCredentials[ nSrvIdx ];
-                    if ( !cred.m_strUsername.empty() )
-                    {
-                        // Compute long-term key: MD5(username:realm:password)
-                        std::string strRealm( reinterpret_cast<const char*>( pRealmAttr->m_pData ), pRealmAttr->m_nLength );
-                        std::string strNonce( reinterpret_cast<const char*>( pNonceAttr->m_pData ), pNonceAttr->m_nLength );
-                        uint8 arrKey[16];
-                        std::string strKeyInput = cred.m_strUsername + ":" + strRealm + ":" + cred.m_strPassword;
-                        CCrypto::GenerateMD5Digest( strKeyInput.c_str(), strKeyInput.size(), (MD5Digest_t*)arrKey );
+                    SpewVerboseGroup( GlobalConfig::LogLevel_P2PRendezvous.Get(),
+                        "ICE: TURN server %s sent %d, retrying with %s credentials for user '%s'.\n",
+                        CUtlNetAdrRender( info.m_pRequest->m_remoteAddr ).String(), nErrorCode,
+                        nErrorCode == k_nTURNErrorCode_StaleNonce ? "refreshed" : "long-term", cred.m_strUsername.c_str() );
 
-                        SpewVerboseGroup( GlobalConfig::LogLevel_P2PRendezvous.Get(),
-                            "ICE: TURN server %s sent 401, retrying with long-term credentials for user '%s'.\n",
-                            CUtlNetAdrRender( info.m_pRequest->m_remoteAddr ).String(), cred.m_strUsername.c_str() );
-
-                        pIntf->QueueAllocateDiscoveryRequest( nSrvIdx, &strRealm, &strNonce, arrKey );
-                        return;
-                    }
+                    pIntf->QueueAllocateDiscoveryRequest( nSrvIdx, &strRealm, &strNonce, arrKey, info.m_pRequest->m_nAuthRetriesUsed + 1 );
+                    return;
                 }
             }
         }
@@ -2334,20 +2359,48 @@ void CSteamNetworkingICESession::STUNRequestCallback_RefreshAllocation( const Re
 
     if ( info.m_pHeader != nullptr )
     {
-        // Refresh succeeded -- parse the returned LIFETIME and schedule the next one.
-        const STUNAttribute *pLifetimeAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nTURN_Attr_Lifetime );
-        if ( pLifetimeAttr != nullptr && pLifetimeAttr->m_nLength == 4 )
+        const STUNAttribute *pErrorAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nSTUN_Attr_ErrorCode );
+        const int nErrorCode = GetSTUNErrorCode( pErrorAttr );
+
+        // Stale (or newly required) credentials -- fetch a fresh nonce and retry once
+        // rather than tearing down a perfectly good allocation over an expired nonce.
+        if ( ( nErrorCode == k_nTURNErrorCode_Unauthorized || nErrorCode == k_nTURNErrorCode_StaleNonce )
+            && info.m_pRequest->m_nAuthRetriesUsed < 2 )
         {
-            SteamNetworkingMicroseconds usecLifetime = (SteamNetworkingMicroseconds)ntohl( pLifetimeAttr->m_pData[0] ) * k_nMillion;
-            pIntf->m_usecRefreshAfter = info.m_usecNow + usecLifetime / 2;
+            const int nSrvIdx = index_of( m_vecTURNServers, pIntf->m_addrTURNServer );
+            if ( nSrvIdx >= 0 )
+            {
+                const TURNCredentials &cred = m_vecTURNCredentials[ nSrvIdx ];
+                if ( !cred.m_strUsername.empty()
+                    && ExtractTURNChallenge( info, cred.m_strUsername, cred.m_strPassword, pIntf->m_strTURNRealm, pIntf->m_strTURNNonce, pIntf->m_arrTURNKey ) )
+                {
+                    SpewVerboseGroup( GlobalConfig::LogLevel_P2PRendezvous.Get(),
+                        "ICE: TURN server %s sent %d on Refresh, retrying with fresh credentials.\n",
+                        CUtlNetAdrRender( pIntf->m_addrTURNServer ).String(), nErrorCode );
+                    pIntf->QueueRefreshRequest( &CSteamNetworkingICESession::STUNRequestCallback_RefreshAllocation, m_nEncoding, info.m_pRequest->m_nAuthRetriesUsed + 1 );
+                    return;
+                }
+            }
         }
-        return;
+
+        if ( nErrorCode == 0 )
+        {
+            // Genuine success -- parse the returned LIFETIME and schedule the next refresh.
+            const STUNAttribute *pLifetimeAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nTURN_Attr_Lifetime );
+            if ( pLifetimeAttr != nullptr && pLifetimeAttr->m_nLength == 4 )
+            {
+                SteamNetworkingMicroseconds usecLifetime = (SteamNetworkingMicroseconds)ntohl( pLifetimeAttr->m_pData[0] ) * k_nMillion;
+                pIntf->m_usecRefreshAfter = info.m_usecNow + usecLifetime / 2;
+            }
+            return;
+        }
+        // Else: a non-recoverable error response.  Fall through to teardown below.
     }
 
-    // Refresh timed out -- the allocation is gone.  Tear down relay state so
-    // Think_DiscoverRelayCandidate will re-allocate, and remove all candidate
+    // Timed out, or a non-recoverable error -- the allocation is gone.  Tear down relay
+    // state so Think_DiscoverRelayCandidate will re-allocate, and remove all candidate
     // pairs that depended on this relay.
-    SpewMsg( "ICE: TURN Refresh timed out for %s -- tearing down relay allocation\n",
+    SpewMsg( "ICE: TURN Refresh failed for %s -- tearing down relay allocation\n",
         CUtlNetAdrRender( pIntf->m_addrTURNServer ).String() );
 
     for ( int j = len( m_vecCandidatePairs ) - 1; j >= 0; --j )
@@ -2494,6 +2547,23 @@ void CSteamNetworkingICESession::STUNRequestCallback_CreatePermission( const Rec
     {
         // Timed out.  m_nTURNPermissionRevision is still stale, so Think_TURNMaintenance
         // will retry on the next Think() sweep.
+        return;
+    }
+
+    const STUNAttribute *pErrorAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nSTUN_Attr_ErrorCode );
+    const int nErrorCode = GetSTUNErrorCode( pErrorAttr );
+    if ( nErrorCode == k_nTURNErrorCode_Unauthorized || nErrorCode == k_nTURNErrorCode_StaleNonce )
+    {
+        // Refresh our nonce (and key) for next time.  Leave m_nTURNPermissionRevision stale
+        // so Think_TURNMaintenance retries next tick, automatically picking up the new
+        // credentials since it reads them fresh from the interface each time.
+        const int nSrvIdx = index_of( m_vecTURNServers, pIntf->m_addrTURNServer );
+        if ( nSrvIdx >= 0 )
+        {
+            const TURNCredentials &cred = m_vecTURNCredentials[ nSrvIdx ];
+            if ( !cred.m_strUsername.empty() )
+                ExtractTURNChallenge( info, cred.m_strUsername, cred.m_strPassword, pIntf->m_strTURNRealm, pIntf->m_strTURNNonce, pIntf->m_arrTURNKey );
+        }
         return;
     }
 
