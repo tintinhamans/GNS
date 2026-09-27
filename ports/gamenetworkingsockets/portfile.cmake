@@ -2,9 +2,9 @@
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO tintinhamans/GNS
-    REF "ff7c99d8d3ba351d5f4bf3d3c6c44e90a5a5b69c" # ice-parallel-discovery
-    SHA512 7e1afe1aa8e24244492cb7563a90b362c5e94a331c245f28017a5272332fb486192817e4203af207cf0861ca96cddd0e914353e2ae0a34e5d57a05d6b1ef43ed
-    HEAD_REF ice-parallel-discovery
+    REF "931109d6fa750ba1a84f8b843d7d804e8f761953" # ice-interface-ranking-ipv6
+    SHA512 ea6d5f56f5a4bb3a4d183798991a1635d89691ff20b23b5408260fc1c0f6ee47e7d73d0878e3a30d253312ba1a48d8d3453891ef0a788ce57b9688bc57ca90aa
+    HEAD_REF ice-interface-ranking-ipv6
 )
 
 vcpkg_check_features(
