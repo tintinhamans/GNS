@@ -166,7 +166,7 @@ namespace SteamNetworkingSocketsLib {
         // long-term-credential state for this specific server if a prior challenge already
         // primed them; null for a first attempt.  nAuthRetriesUsed bounds the challenge/retry
         // loop against a misbehaving server.
-        void QueueAllocateDiscoveryRequest( int nTURNServerIdx, const std::string *pRealm, const std::string *pNonce, const uint8 *pKey, int nAuthRetriesUsed = 0 );
+        void QueueAllocateDiscoveryRequest( int nTURNServerIdx, const std::string *pRealm, const std::string *pNonce, const uint8 *pKey, int nAuthRetriesUsed = 0, bool bForceIPv4Relay = false );
 
         // Send a TURN Refresh request to keep the allocation alive.
         void QueueRefreshRequest( RecvSTUNPacketCallback_t cb, int nEncoding, int nAuthRetriesUsed = 0 );
@@ -264,12 +264,15 @@ namespace SteamNetworkingSocketsLib {
     const uint32 k_nTURN_Attr_Lifetime           = 0x000D;
     const uint32 k_nTURN_Attr_XORPeerAddress     = 0x0012;
     const uint32 k_nTURN_Attr_Data               = 0x0013;
+    const uint32 k_nTURN_Attr_RequestedAddressFamily = 0x0017; // RFC 8656 sec 18.5
     const uint32 k_nTURN_Attr_XORRelayedAddress  = 0x0016;
     const uint32 k_nTURN_Attr_RequestedTransport = 0x0019;
 
-    // STUN/TURN error codes we act on (RFC 5389 sec 15.6, RFC 5766 sec 10).
-    const int k_nTURNErrorCode_Unauthorized = 401; // no (or wrong) long-term credentials
-    const int k_nTURNErrorCode_StaleNonce   = 438; // credentials were fine, but the nonce expired
+    // STUN/TURN error codes we act on (RFC 5389 sec 15.6, RFC 5766 sec 10, RFC 8656 sec 18.6).
+    const int k_nTURNErrorCode_Unauthorized          = 401; // no (or wrong) long-term credentials
+    const int k_nTURNErrorCode_StaleNonce            = 438; // credentials were fine, but the nonce expired
+    const int k_nTURNErrorCode_UnknownAttribute      = 420; // server doesn't understand REQUESTED-ADDRESS-FAMILY
+    const int k_nTURNErrorCode_AddressFamilyNotSupported = 440; // server understands it, but won't allocate IPv6 here
 
     enum STUNPacketEncodingFlags
     {
@@ -322,6 +325,12 @@ namespace SteamNetworkingSocketsLib {
         // auth challenge (401 or 438).  Carried forward into each retry's replacement
         // request and capped to stop a misbehaving server from looping us forever.
         int m_nAuthRetriesUsed = 0;
+
+        // For TURN Allocate requests only: true if this specific attempt asked for an IPv6
+        // relay (RFC 8656 REQUESTED-ADDRESS-FAMILY).  Lets the response handler tell a genuine
+        // "unknown attribute" (420) or "family not supported" (440) apart from an unrelated
+        // error, so it knows to retry once without the attribute instead of giving up.
+        bool m_bRequestedIPv6Relay = false;
 
         // Serialize the packet and start the retry loop.
         void Queue( uint32 nMessageType, int nEncoding, netadr_t remoteAddr, RecvSTUNPacketCallback_t cb, STUNAttribute *pExtraAttrs = nullptr, int nExtraAttrs = 0 );
