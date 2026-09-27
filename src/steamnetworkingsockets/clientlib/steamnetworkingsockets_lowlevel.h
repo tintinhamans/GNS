@@ -352,10 +352,28 @@ extern bool ResolveHostname( const char* pszHostname, CUtlVector< SteamNetworkin
 extern void JoinICEDNSThreads();
 #endif
 
+// Coarse adapter kind, used to rank local interfaces when we have more than one to choose
+// from.  Higher value == generally better for real-world connectivity.  Virtual adapters
+// (VPN/tunnel/tap) rank lowest but are never dropped -- players legitimately connect over
+// Hamachi/ZeroTier/WireGuard/etc.
+enum EICEAdapterKind
+{
+	k_EICEAdapterKind_Unknown = -1,        // No metadata available (e.g. POSIX).  Never mixed with real values from the same GetLocalAddresses call.
+	k_EICEAdapterKind_Virtual = 0,         // VPN, tunnel, or other virtual/software adapter
+	k_EICEAdapterKind_OtherPhysical = 1,   // Cellular/PPP/other physical adapter we didn't specifically recognize
+	k_EICEAdapterKind_WiFi = 2,
+	k_EICEAdapterKind_Ethernet = 3,
+};
+
 struct LocalAddress_t
 {
 	SteamNetworkingIPAddr m_addr;
 	int m_nPrefixLen; // Subnet prefix length, e.g. 24 for a /24.  0 if unavailable or bogus.
+
+	// Interface ranking metadata.  Only populated where we can determine it (currently Windows);
+	// left at these defaults elsewhere, which are a no-op for ranking purposes (see GatherInterfaces).
+	bool m_bDefaultRoute = false;                                // True if this adapter currently carries the OS default route for this address's family
+	int m_nAdapterKind = k_EICEAdapterKind_Unknown;              // EICEAdapterKind
 };
 extern bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs );
 
