@@ -2774,7 +2774,10 @@ void CSteamNetworkingICESession::Think_TestPeerConnectivity()
                 const ICELocalCandidate &localCand = localCandidates[iLocal];
                 for ( ICEPeerCandidate &remoteCandidate : m_vecPeerCandidates )
                 {
-                    if ( localCand.m_pInterface->m_boundAddr.GetType() != remoteCandidate.m_addr.GetType() )
+                    // Use the candidate's actual address family, not the interface's: a relay
+                    // candidate's family is whatever the TURN server allocated, which isn't
+                    // guaranteed to match the interface it was allocated from.
+                    if ( localCand.GetAddressType() != remoteCandidate.m_addr.GetType() )
                         continue;
                     bool bFound = false;
                     for ( ICECandidatePair *pPair : m_vecCandidatePairs )

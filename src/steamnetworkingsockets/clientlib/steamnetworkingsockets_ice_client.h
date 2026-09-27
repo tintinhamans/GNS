@@ -200,6 +200,17 @@ namespace SteamNetworkingSocketsLib {
         ICESessionInterface *m_pInterface;
         netadr_t m_addrTURNServer;  // invalid = host candidate
         bool IsRelay() const { return m_addrTURNServer.IsValid(); }
+
+        // The address family this candidate actually sends/receives on.  For a host candidate
+        // that's the bound interface address; for a relay candidate it's the TURN-allocated
+        // relayed address, which is not guaranteed to match the interface's own family (e.g. a
+        // TURN server that ignores REQUESTED-ADDRESS-FAMILY and always relays over IPv4).
+        // RFC 8445 pairing must be done strictly within one address family, so this -- not the
+        // interface's bound address -- is what candidate-pair formation should compare against.
+        ipadrtype_t GetAddressType() const
+        {
+            return IsRelay() ? m_pInterface->m_addrRelayed.GetType() : m_pInterface->m_boundAddr.GetType();
+        }
     };
 
     // Parsed representation of an RFC 5245 candidate-attribute line.
