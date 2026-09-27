@@ -1179,7 +1179,7 @@ void ICESessionInterface::ReleaseTURNAllocation( const netadr_t &addrTURNServer,
     STUNAttribute attrs[4];
     int nAttrs = 0;
     attrs[nAttrs++] = attrLifetime;
-    if ( !strRealm.empty() )
+    if ( !strRealm.empty() && nTURNServerIdx >= 0 && nTURNServerIdx < len( m_session.m_vecTURNCredentials ) )
     {
         const std::string &strUsername = m_session.m_vecTURNCredentials[ nTURNServerIdx ].m_strUsername;
         attrs[nAttrs].m_nType = k_nSTUN_Attr_UserName; attrs[nAttrs].m_nLength = (uint32)strUsername.size(); attrs[nAttrs].m_pData = reinterpret_cast<const uint32*>( strUsername.c_str() ); ++nAttrs;
@@ -2258,6 +2258,9 @@ bool CSteamNetworkingICESession::BAllCandidatesExhausted( SteamNetworkingMicrose
 void CSteamNetworkingICESession::Think_CheckAllCandidatesFailed( SteamNetworkingMicroseconds usecNow )
 {
     if ( m_bAllCandidatesFailedNotified )
+        return;
+    // A selected pair is a working route; never fail over the top of it.
+    if ( m_pSelectedCandidatePair )
         return;
     if ( !BAllCandidatesExhausted( usecNow ) )
         return;
