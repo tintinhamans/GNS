@@ -1123,7 +1123,7 @@ bool ICESessionInterface::QueueTURNRequest( uint32 nMsgType, int nEncoding, cons
     return true;
 }
 
-void ICESessionInterface::QueueAllocateDiscoveryRequest( int nTURNServerIdx, const std::string *pRealm, const std::string *pNonce, const uint8 *pKey, int nAuthRetriesUsed )
+void ICESessionInterface::QueueAllocateDiscoveryRequest( int nTURNServerIdx, const std::string *pRealm, const std::string *pNonce, const uint8 *pKey, int nAuthRetriesUsed, bool bForceIPv4Relay )
 {
     // REQUESTED-TRANSPORT: UDP (IANA protocol 17), protocol byte + 3 RFFU bytes
     uint32 uTransport = htonl( 17u << 24 );
@@ -1132,9 +1132,24 @@ void ICESessionInterface::QueueAllocateDiscoveryRequest( int nTURNServerIdx, con
     reqTransport.m_nLength = 4;
     reqTransport.m_pData   = &uTransport;
 
+    // RFC 8656 REQUESTED-ADDRESS-FAMILY: without this, a dual-stack TURN server allocates an
+    // IPv4-only relayed address by default, even when we reach it over IPv6.  We only send this
+    // to a server whose address we picked *because* it matched this interface's family (see the
+    // per-family dispatch in Think_DiscoverRelayCandidate).  It's comprehension-required, so a
+    // server that doesn't support RFC 8656 will reject the whole request (420) rather than
+    // ignore it; STUNRequestCallback_AllocateRelay catches that (and 440) and retries once with
+    // bForceIPv4Relay so we still fall back to a plain relay instead of losing the interface.
+    const bool bWantIPv6Relay = ( m_boundAddr.GetType() == k_EIPTypeV6 ) && !bForceIPv4Relay;
+    uint32 uAddrFamily = htonl( 0x02u << 24 ); // 0x02 == AF_INET6 per RFC 8656 sec 18.5
+    STUNAttribute reqAddrFamily;
+    reqAddrFamily.m_nType   = k_nTURN_Attr_RequestedAddressFamily;
+    reqAddrFamily.m_nLength = 4;
+    reqAddrFamily.m_pData   = &uAddrFamily;
+
     auto *pRequest = new CSteamNetworkingSocketsSTUNRequest( this );
     pRequest->m_nServerIdx = nTURNServerIdx;
     pRequest->m_nAuthRetriesUsed = nAuthRetriesUsed;
+    pRequest->m_bRequestedIPv6Relay = bWantIPv6Relay;
     m_vecPendingAllocateRequests.push_back( pRequest );
 
     const netadr_t &addrTURNServer = m_session.m_vecTURNServers[ nTURNServerIdx ];
@@ -1142,7 +1157,12 @@ void ICESessionInterface::QueueAllocateDiscoveryRequest( int nTURNServerIdx, con
 
     if ( pRealm == nullptr )
     {
-        pRequest->Queue( k_nTURN_AllocateRequest, m_session.m_nEncoding | kSTUNPacketEncodingFlags_NoMappedAddress, addrTURNServer, cb, &reqTransport, 1 );
+        STUNAttribute unauthAttrs[2];
+        int nUnauthAttrs = 0;
+        unauthAttrs[nUnauthAttrs++] = reqTransport;
+        if ( bWantIPv6Relay )
+            unauthAttrs[nUnauthAttrs++] = reqAddrFamily;
+        pRequest->Queue( k_nTURN_AllocateRequest, m_session.m_nEncoding | kSTUNPacketEncodingFlags_NoMappedAddress, addrTURNServer, cb, unauthAttrs, nUnauthAttrs );
         return;
     }
 
@@ -1151,17 +1171,20 @@ void ICESessionInterface::QueueAllocateDiscoveryRequest( int nTURNServerIdx, con
     V_memcpy( pRequest->m_arrTURNKey, pKey, sizeof( pRequest->m_arrTURNKey ) );
 
     const std::string &strUsername = m_session.m_vecTURNCredentials[ nTURNServerIdx ].m_strUsername;
-    STUNAttribute allAttrs[4];
-    allAttrs[0] = reqTransport;
-    allAttrs[1].m_nType = k_nSTUN_Attr_UserName; allAttrs[1].m_nLength = (uint32)strUsername.size();               allAttrs[1].m_pData = reinterpret_cast<const uint32*>( strUsername.c_str() );
-    allAttrs[2].m_nType = k_nSTUN_Attr_Realm;    allAttrs[2].m_nLength = (uint32)pRequest->m_strTURNRealm.size();  allAttrs[2].m_pData = reinterpret_cast<const uint32*>( pRequest->m_strTURNRealm.c_str() );
-    allAttrs[3].m_nType = k_nSTUN_Attr_Nonce;    allAttrs[3].m_nLength = (uint32)pRequest->m_strTURNNonce.size();  allAttrs[3].m_pData = reinterpret_cast<const uint32*>( pRequest->m_strTURNNonce.c_str() );
+    STUNAttribute allAttrs[5];
+    int nAllAttrs = 0;
+    allAttrs[nAllAttrs++] = reqTransport;
+    if ( bWantIPv6Relay )
+        allAttrs[nAllAttrs++] = reqAddrFamily;
+    allAttrs[nAllAttrs].m_nType = k_nSTUN_Attr_UserName; allAttrs[nAllAttrs].m_nLength = (uint32)strUsername.size();               allAttrs[nAllAttrs].m_pData = reinterpret_cast<const uint32*>( strUsername.c_str() ); ++nAllAttrs;
+    allAttrs[nAllAttrs].m_nType = k_nSTUN_Attr_Realm;    allAttrs[nAllAttrs].m_nLength = (uint32)pRequest->m_strTURNRealm.size();  allAttrs[nAllAttrs].m_pData = reinterpret_cast<const uint32*>( pRequest->m_strTURNRealm.c_str() ); ++nAllAttrs;
+    allAttrs[nAllAttrs].m_nType = k_nSTUN_Attr_Nonce;    allAttrs[nAllAttrs].m_nLength = (uint32)pRequest->m_strTURNNonce.size();  allAttrs[nAllAttrs].m_pData = reinterpret_cast<const uint32*>( pRequest->m_strTURNNonce.c_str() ); ++nAllAttrs;
 
     pRequest->m_strPassword.assign( (const char*)pRequest->m_arrTURNKey, sizeof( pRequest->m_arrTURNKey ) );
     // RFC 5766 mandates HMAC-SHA1 (not SHA256) for long-term credentials
     pRequest->Queue( k_nTURN_AllocateRequest,
         m_session.m_nEncoding | kSTUNPacketEncodingFlags_NoMappedAddress | kSTUNPacketEncodingFlags_MessageIntegrity,
-        addrTURNServer, cb, allAttrs, 4 );
+        addrTURNServer, cb, allAttrs, nAllAttrs );
 }
 
 void ICESessionInterface::ReleaseTURNAllocation( const netadr_t &addrTURNServer, int nTURNServerIdx, const std::string &strRealm, const std::string &strNonce, const uint8 arrKey[16] )
@@ -2408,6 +2431,26 @@ void CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay( const RecvST
                     return;
                 }
             }
+        }
+
+        // REQUESTED-ADDRESS-FAMILY is comprehension-required: a server that doesn't know it
+        // answers 420, one that knows it but won't hand out IPv6 here answers 440.  Either way,
+        // fall back to a plain (IPv4) relay for this interface instead of giving up on it.
+        // m_bRequestedIPv6Relay guards this to exactly one retry per attempt.
+        if ( !bAlreadyWon && info.m_pRequest->m_bRequestedIPv6Relay
+            && ( nErrorCode == k_nTURNErrorCode_UnknownAttribute || nErrorCode == k_nTURNErrorCode_AddressFamilyNotSupported ) )
+        {
+            SpewVerboseGroup( GlobalConfig::LogLevel_P2PRendezvous.Get(),
+                "ICE: TURN server %s sent %d for REQUESTED-ADDRESS-FAMILY, retrying without it.\n",
+                CUtlNetAdrRender( info.m_pRequest->m_remoteAddr ).String(), nErrorCode );
+
+            const bool bWasAuthenticated = !info.m_pRequest->m_strTURNRealm.empty();
+            pIntf->QueueAllocateDiscoveryRequest( nSrvIdx,
+                bWasAuthenticated ? &info.m_pRequest->m_strTURNRealm : nullptr,
+                bWasAuthenticated ? &info.m_pRequest->m_strTURNNonce : nullptr,
+                bWasAuthenticated ? info.m_pRequest->m_arrTURNKey : nullptr,
+                info.m_pRequest->m_nAuthRetriesUsed, /*bForceIPv4Relay=*/true );
+            return;
         }
 
         // Response received but no usable relay address, and not a retryable challenge.
