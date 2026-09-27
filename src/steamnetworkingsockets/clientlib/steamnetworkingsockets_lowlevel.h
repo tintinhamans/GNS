@@ -347,6 +347,16 @@ extern bool IsRouteToAddressProbablyLocal( netadr_t addr );
 
 extern bool ResolveHostname( const char* pszHostname, CUtlVector< SteamNetworkingIPAddr > *pAddrs );
 
+/// Returns a counter that increments whenever the OS reports a network configuration change
+/// (an adapter coming up/down, an address being added/removed, e.g. a Wi-Fi switch or a VPN
+/// connecting).  ICE sessions poll this on their regular think tick to decide whether to
+/// regather local interfaces, without needing a global registry of active sessions.  Cheap
+/// to call (an atomic load after the first call, which lazily registers for notifications).
+/// Always returns 0 on platforms without a lightweight way to detect this (currently: only
+/// implemented on Windows), so ICE sessions there simply won't auto-regather on network
+/// change, matching current behavior.
+extern uint32 GetNetworkChangeGeneration();
+
 #ifdef STEAMNETWORKINGSOCKETS_ENABLE_ICE
 /// Wait for ICE STUN/TURN hostname lookups that are still running.
 extern void JoinICEDNSThreads();
@@ -375,7 +385,12 @@ struct LocalAddress_t
 	bool m_bDefaultRoute = false;                                // True if this adapter currently carries the OS default route for this address's family
 	int m_nAdapterKind = k_EICEAdapterKind_Unknown;              // EICEAdapterKind
 };
-extern bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs );
+// pAddrs gets the (possibly deduped/ranked) candidate addresses to gather ICE interfaces from.
+// pAllAssignedAddrs, if non-null, gets every address still actually assigned to a local adapter,
+// even ones pAddrs left out (e.g. a deprecated IPv6 privacy address that lost the "pick one per
+// adapter" contest but is still bound and still works).  Callers use it to avoid tearing down an
+// interface that's merely no longer preferred, as opposed to one that's truly gone.
+extern bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs, CUtlVector<SteamNetworkingIPAddr> *pAllAssignedAddrs = nullptr );
 
 /////////////////////////////////////////////////////////////////////////////
 //
