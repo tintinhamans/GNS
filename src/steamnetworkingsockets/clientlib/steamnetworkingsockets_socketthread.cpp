@@ -4277,9 +4277,27 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
 
     for( PIP_ADAPTER_ADDRESSES_LH pThisInfo = pAddrInfo; pThisInfo != nullptr; pThisInfo = pThisInfo->Next )
     {
+        // Skip only adapters that are clearly unusable.  Dormant/Unknown/Testing still get a
+        // chance -- some drivers (notably some VPN/virtual adapters) never report Up.  We never
+        // filter by adapter *kind* here -- players legitimately connect over VPN/Hamachi/etc.
+        if ( pThisInfo->OperStatus == IfOperStatusDown
+            || pThisInfo->OperStatus == IfOperStatusNotPresent
+            || pThisInfo->OperStatus == IfOperStatusLowerLayerDown )
+            continue;
+
         const int nAdapterKind = ClassifyAdapterKind( pThisInfo );
         const bool bDefaultRouteV4 = ( dwDefaultRouteIfIndexV4 != 0 && pThisInfo->IfIndex == dwDefaultRouteIfIndexV4 );
         const bool bDefaultRouteV6 = ( dwDefaultRouteIfIndexV6 != 0 && pThisInfo->Ipv6IfIndex == dwDefaultRouteIfIndexV6 );
+
+        // An adapter can carry many IPv6 addresses at once (privacy/temporary addresses,
+        // DHCPv6-PD, an old address lingering during renumbering, etc).  Using all of them as
+        // separate ICE candidates would multiply STUN/TURN/DNS work for no connectivity benefit,
+        // so track just the best global-unicast one and the best ULA (fc00::/7) one here, and
+        // add at most one of them (preferring global) after scanning the adapter's addresses.
+        bool bHaveGlobalV6 = false, bGlobalV6Stable = false;
+        SteamNetworkingIPAddr bestGlobalV6; int nBestGlobalV6PrefixLen = 0;
+        bool bHaveULAV6 = false, bULAV6Stable = false;
+        SteamNetworkingIPAddr bestULAV6; int nBestULAV6PrefixLen = 0;
 
         for ( PIP_ADAPTER_UNICAST_ADDRESS_LH pThisAddr = pThisInfo->FirstUnicastAddress; pThisAddr != nullptr; pThisAddr = pThisAddr->Next )
         {
@@ -4308,12 +4326,60 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
 			if ( GetLocalAddresses_IsReserved( ipAddr ) )
 				continue;
 
-            // Got a host address, record it!
+			if ( bIsV6 )
+			{
+				// Skip anything not fully usable: tentative (DAD still running), duplicate
+				// (DAD failed), or deprecated (valid, but being phased out in favor of another
+				// address on this adapter).
+				if ( pThisAddr->DadState != IpDadStatePreferred )
+					continue;
+
+				// Prefer a stable address (EUI-64/manual/DHCPv6) over a temporary/privacy one,
+				// since it's less likely to rotate out from under an in-progress connection.
+				const bool bStable = ( pThisAddr->SuffixOrigin != IpSuffixOriginRandom );
+				const bool bULA = ( ipAddr.m_ipv6[0] & 0xfe ) == 0xfc; // fc00::/7
+
+				if ( bULA )
+				{
+					if ( !bHaveULAV6 || ( bStable && !bULAV6Stable ) )
+					{
+						bestULAV6 = ipAddr;
+						nBestULAV6PrefixLen = pThisAddr->OnLinkPrefixLength;
+						bULAV6Stable = bStable;
+						bHaveULAV6 = true;
+					}
+				}
+				else
+				{
+					if ( !bHaveGlobalV6 || ( bStable && !bGlobalV6Stable ) )
+					{
+						bestGlobalV6 = ipAddr;
+						nBestGlobalV6PrefixLen = pThisAddr->OnLinkPrefixLength;
+						bGlobalV6Stable = bStable;
+						bHaveGlobalV6 = true;
+					}
+				}
+				continue;
+			}
+
+            // Got an IPv4 host address, record it!
 			LocalAddress_t &entry = *pAddrs->AddToTailGetPtr();
 			entry.m_addr = ipAddr;
 			entry.m_nPrefixLen = pThisAddr->OnLinkPrefixLength; // UINT8; 0 is bogus for a unicast addr
 			entry.m_nAdapterKind = nAdapterKind;
-			entry.m_bDefaultRoute = bIsV6 ? bDefaultRouteV6 : bDefaultRouteV4;
+			entry.m_bDefaultRoute = bDefaultRouteV4;
+        }
+
+        // Record at most one IPv6 address for this adapter: prefer the best global-unicast
+        // one; fall back to a ULA if that's all the adapter has (some VPN/mesh adapters --
+        // e.g. ZeroTier -- only ever hand out ULAs).
+        if ( bHaveGlobalV6 || bHaveULAV6 )
+        {
+			LocalAddress_t &entry = *pAddrs->AddToTailGetPtr();
+			entry.m_addr = bHaveGlobalV6 ? bestGlobalV6 : bestULAV6;
+			entry.m_nPrefixLen = bHaveGlobalV6 ? nBestGlobalV6PrefixLen : nBestULAV6PrefixLen;
+			entry.m_nAdapterKind = nAdapterKind;
+			entry.m_bDefaultRoute = bDefaultRouteV6;
         }
     }
 
