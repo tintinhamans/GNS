@@ -12,6 +12,7 @@
 #include "crypto.h"
 #include "steamnetworkingsockets_mock.h"
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -1787,6 +1788,20 @@ void CSteamNetworkingICESession::GatherInterfaces()
         if ( intf->m_nPriority <= uNextPriority )
             uNextPriority = intf->m_nPriority-1;
     }
+
+    // Rank the newly discovered addresses before assigning priorities, so the interface most
+    // likely to give good real-world connectivity gets first pick: the adapter carrying the OS
+    // default route, then physical adapters by kind (Ethernet > Wi-Fi > cellular/other), then
+    // virtual/VPN/tunnel adapters last.  Virtual adapters are never dropped here -- players
+    // routinely connect over Hamachi/ZeroTier/WireGuard/etc.  On platforms that don't populate
+    // this metadata (POSIX), every entry compares equal and stable_sort leaves the original OS
+    // enumeration order untouched, matching current behavior.
+    std::stable_sort( vecAddrs.begin(), vecAddrs.end(), []( const LocalAddress_t &a, const LocalAddress_t &b )
+    {
+        if ( a.m_bDefaultRoute != b.m_bDefaultRoute )
+            return a.m_bDefaultRoute;
+        return a.m_nAdapterKind > b.m_nAdapterKind;
+    } );
 
     // Second pass: add genuinely new interfaces.  Assign priorities counting
     // down from just below the lowest surviving priority (or from 65535 if

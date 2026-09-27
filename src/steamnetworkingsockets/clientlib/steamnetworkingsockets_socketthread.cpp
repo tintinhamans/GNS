@@ -4119,6 +4119,88 @@ static int IPv6MaskToPrefixLen( const uint8 *pMask )
 	return n; // 0 means all-zero mask, which is bogus
 }
 
+#if IsWindows()
+
+// Ask the OS which interface currently carries the default route toward a well-known public
+// address, for the given family.  Returns 0 if we can't determine it (missing API, no route,
+// etc) -- this is only used to rank interfaces for ICE gathering, so it's never fatal.
+static NET_IFINDEX GetDefaultRouteIfIndex( bool bIPv6 )
+{
+	typedef DWORD (WINAPI *FnGetBestInterfaceEx)( struct sockaddr *pDestAddr, PDWORD pdwBestIfIndex );
+	static HMODULE hModule = LoadLibraryA( "Iphlpapi.dll" );
+	static FnGetBestInterfaceEx pGetBestInterfaceEx = hModule ? (FnGetBestInterfaceEx)GetProcAddress( hModule, "GetBestInterfaceEx" ) : nullptr;
+	if ( !pGetBestInterfaceEx )
+		return 0;
+
+	netadr_t probe;
+	if ( bIPv6 )
+	{
+		// 2001:4860:4860::8888 (Google public DNS)
+		static const byte pubV6[16] = { 0x20,0x01,0x48,0x60,0x48,0x60,0,0,0,0,0,0,0,0,0x88,0x88 };
+		probe.SetIPV6( pubV6, 0 );
+	}
+	else
+	{
+		probe.SetIPv4( 8, 8, 8, 8 ); // Google public DNS
+	}
+
+	sockaddr_storage sockaddrDest;
+	probe.ToSockadr( &sockaddrDest );
+
+	NET_IFINDEX dwBestIfIndex = 0;
+	DWORD r = (*pGetBestInterfaceEx)( (sockaddr *)&sockaddrDest, &dwBestIfIndex );
+	if ( r != NO_ERROR )
+		return 0;
+	return dwBestIfIndex;
+}
+
+// Case-insensitive substring search, to avoid pulling in shlwapi just for StrStrIW.
+static bool WStrContainsCI( const wchar_t *pszHaystack, const wchar_t *pszNeedle )
+{
+	if ( pszHaystack == nullptr || pszNeedle == nullptr || *pszNeedle == L'\0' )
+		return false;
+	size_t cchNeedle = wcslen( pszNeedle );
+	for ( const wchar_t *p = pszHaystack; *p != L'\0'; ++p )
+	{
+		if ( _wcsnicmp( p, pszNeedle, cchNeedle ) == 0 )
+			return true;
+	}
+	return false;
+}
+
+// Classify an adapter as ethernet/wifi/other-physical/virtual so GatherInterfaces can rank it.
+// This only affects ordering -- virtual adapters (VPN/Hamachi/ZeroTier/Hyper-V/etc) are never
+// dropped, since players legitimately connect over them.
+static int ClassifyAdapterKind( const IP_ADAPTER_ADDRESSES_LH *pAdapter )
+{
+	if ( pAdapter->IfType == IF_TYPE_TUNNEL || pAdapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK || pAdapter->TunnelType != TUNNEL_TYPE_NONE )
+		return k_EICEAdapterKind_Virtual;
+
+	// Many VPN/virtualization adapters present themselves as ordinary ethernet to the OS,
+	// so also check the friendly description for common virtual adapter vendors/technologies.
+	if ( pAdapter->Description != nullptr )
+	{
+		static const wchar_t * const s_pszVirtualHints[] =
+		{
+			L"VPN", L"TAP-", L"Tunnel", L"Virtual", L"Hamachi", L"ZeroTier", L"WireGuard", L"Hyper-V", L"VMware", L"VirtualBox", L"Loopback",
+		};
+		for ( const wchar_t *pszHint : s_pszVirtualHints )
+		{
+			if ( WStrContainsCI( pAdapter->Description, pszHint ) )
+				return k_EICEAdapterKind_Virtual;
+		}
+	}
+
+	switch ( pAdapter->IfType )
+	{
+		case IF_TYPE_ETHERNET_CSMACD: return k_EICEAdapterKind_Ethernet;
+		case IF_TYPE_IEEE80211:       return k_EICEAdapterKind_WiFi;
+		default:                      return k_EICEAdapterKind_OtherPhysical;
+	}
+}
+
+#endif // IsWindows()
+
 bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
 {
 
@@ -4189,14 +4271,23 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
         return false;
     }
 
+    // Ranking metadata is per-adapter, so look up the default-route interfaces once up front.
+    const NET_IFINDEX dwDefaultRouteIfIndexV4 = GetDefaultRouteIfIndex( false );
+    const NET_IFINDEX dwDefaultRouteIfIndexV6 = GetDefaultRouteIfIndex( true );
+
     for( PIP_ADAPTER_ADDRESSES_LH pThisInfo = pAddrInfo; pThisInfo != nullptr; pThisInfo = pThisInfo->Next )
     {
+        const int nAdapterKind = ClassifyAdapterKind( pThisInfo );
+        const bool bDefaultRouteV4 = ( dwDefaultRouteIfIndexV4 != 0 && pThisInfo->IfIndex == dwDefaultRouteIfIndexV4 );
+        const bool bDefaultRouteV6 = ( dwDefaultRouteIfIndexV6 != 0 && pThisInfo->Ipv6IfIndex == dwDefaultRouteIfIndexV6 );
+
         for ( PIP_ADAPTER_UNICAST_ADDRESS_LH pThisAddr = pThisInfo->FirstUnicastAddress; pThisAddr != nullptr; pThisAddr = pThisAddr->Next )
         {
             if ( pThisAddr->Address.lpSockaddr == nullptr )
                 continue;
 
             SteamNetworkingIPAddr ipAddr;
+            bool bIsV6 = false;
             if ( pThisAddr->Address.lpSockaddr->sa_family == AF_INET )
             {
                 sockaddr_in* pAddrIN = ( sockaddr_in* )( pThisAddr->Address.lpSockaddr );
@@ -4206,6 +4297,7 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
             {
                 sockaddr_in6* pAddrIN6 = ( sockaddr_in6* )( pThisAddr->Address.lpSockaddr );
                 ipAddr.SetIPv6( pAddrIN6->sin6_addr.u.Byte, pAddrIN6->sin6_port );
+                bIsV6 = true;
             }
             else
             {
@@ -4220,6 +4312,8 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
 			LocalAddress_t &entry = *pAddrs->AddToTailGetPtr();
 			entry.m_addr = ipAddr;
 			entry.m_nPrefixLen = pThisAddr->OnLinkPrefixLength; // UINT8; 0 is bogus for a unicast addr
+			entry.m_nAdapterKind = nAdapterKind;
+			entry.m_bDefaultRoute = bIsV6 ? bDefaultRouteV6 : bDefaultRouteV4;
         }
     }
 
