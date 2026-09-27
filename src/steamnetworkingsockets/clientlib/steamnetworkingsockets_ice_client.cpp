@@ -1665,7 +1665,40 @@ void CSteamNetworkingICESession::SetSelectedCandidatePair( ICECandidatePair *pPa
             CUtlNetAdrRender( pPair->m_localCandidate.m_pInterface->m_boundAddr ).String(),
             CUtlNetAdrRender( pPair->m_remoteCandidate.m_addr ).String() );
     }
+    ICECandidatePair * const pOldSelected = m_pSelectedCandidatePair;
     m_pSelectedCandidatePair = pPair;
+
+    // This pair is now the one and only nomination -- every other pair's flag (the previous
+    // selection's included) is cleared, and any pending nomination is resolved one way or
+    // another by this switch (either this *is* that nomination confirming, or something else
+    // entirely won the selection first) -- either way, nothing left to track as pending.
+    for ( ICECandidatePair *pOther : m_vecCandidatePairs )
+    {
+        if ( pOther != pPair )
+            pOther->m_bNominated = false;
+    }
+    pPair->m_bNominated = true;
+    m_pPendingNomination = nullptr;
+
+    // A switch away from a pair that had actually failed is a failure-driven failover; gate
+    // win-back's minimum-dwell requirement off this timestamp specifically -- not off the
+    // initial selection or a normal opportunistic upgrade, so e.g. a relay->direct upgrade
+    // right at connection start is never delayed by it.
+    if ( pOldSelected != nullptr && pOldSelected->m_nState == kICECandidatePairState_Failed )
+        m_usecLastFailoverTime = SteamNetworkingSockets_GetLocalTimestamp();
+
+    // Reseed the periodic-check schedule so the newly-active path picks up the tighter
+    // selected-pair consent interval on the next Think_PingSelectedAndBackupPairs pass,
+    // instead of waiting out whatever backup-ping schedule it had before promotion.  Also
+    // give it a clean liveness slate: whatever got it selected (a nominated check succeeding,
+    // or an incoming USE-CANDIDATE) is itself proof of life, and a pair that was previously
+    // demoted shouldn't carry over stale failure/success counts into its new term as the
+    // active path.
+    pPair->m_usecNextPeriodicCheck = 0;
+    pPair->m_usecLastRecv = SteamNetworkingSockets_GetLocalTimestamp();
+    pPair->m_nConsecutiveFailedChecks = 0;
+    pPair->m_nConsecutiveSuccessfulChecks = 0;
+
     if ( m_pCallbacks )
         m_pCallbacks->OnConnectionSelected( pPair->m_localCandidate, pPair->m_remoteCandidate );
 }
@@ -1675,6 +1708,16 @@ void CSteamNetworkingICESession::InternalDeleteCandidatePair( ICECandidatePair *
     if ( pPair == m_pSelectedCandidatePair )
     {
         m_pSelectedCandidatePair = nullptr;
+    }
+
+    // Must not leave this dangling -- it's read (and its ->m_pPeerRequest/->m_bNominated
+    // written) from STUNRequestCallback_PeerConnectivityCheck and Think_PingSelectedAndBackupPairs.
+    // pPair's own in-flight request (if any) is cancelled and freed just below regardless, so
+    // there's nothing left to cancel here -- just stop pointing at freed memory.  This also
+    // covers session teardown: the destructor runs every pair through this same function.
+    if ( pPair == m_pPendingNomination )
+    {
+        m_pPendingNomination = nullptr;
     }
 
     if ( pPair->m_pPeerRequest != nullptr )
@@ -1895,6 +1938,20 @@ static CSteamNetworkingSocketsSTUNRequest *FindPendingRequestByTransactionID( co
 void CSteamNetworkingICESession::OnPacketReceived( const RecvPktInfo_t &info, ICESessionInterface *pInterface, netadr_t *pAddrRelay )
 {
 	SteamNetworkingGlobalLock::AssertHeldByCurrentThread( "CSteamNetworkingICESession::OnPacketReceived" );
+
+    // Any inbound packet -- STUN control traffic or application data -- that arrives on
+    // exactly the selected pair's (interface, relay, remote-address) tuple is proof the path
+    // is still alive, independent of whether it's a reply to one of our own periodic checks.
+    // Think_PingSelectedAndBackupPairs/the failover decision in
+    // STUNRequestCallback_PeerConnectivityCheck use this alongside consecutive check failures
+    // so a single lost check response doesn't look like a dead path when data is still flowing.
+    if ( m_pSelectedCandidatePair != nullptr
+        && m_pSelectedCandidatePair->m_localCandidate.m_pInterface == pInterface
+        && m_pSelectedCandidatePair->m_localCandidate.m_addrTURNServer == ( pAddrRelay ? *pAddrRelay : netadr_t() )
+        && m_pSelectedCandidatePair->m_remoteCandidate.m_addr == info.m_adrFrom )
+    {
+        m_pSelectedCandidatePair->m_usecLastRecv = info.m_usecNow;
+    }
 
     //
     // Quick check if packet might be a STUN packet, and unpacket the header
@@ -2184,30 +2241,72 @@ not_stun:
         ) {
             SetSelectedCandidatePair( pThisPair );
         }
+        else if ( pThisPair == m_pSelectedCandidatePair )
+        {
+            // Re-nominated while not confirmed alive; check now instead of waiting for the next ping.
+            if ( pThisPair->m_pPeerRequest != nullptr )
+                pThisPair->m_pPeerRequest->RetriggerNow();
+            else if ( !has_element( m_vecTriggeredCheckQueue, pThisPair ) )
+            {
+                pThisPair->m_nState = kICECandidatePairState_Waiting;
+                m_vecTriggeredCheckQueue.push_back( pThisPair );
+            }
+        }
         else if (
             m_pSelectedCandidatePair == nullptr
             || pThisPair->m_nPriority > m_pSelectedCandidatePair->m_nPriority
         ) {
-            bool bAlreadyHaveANomination = false;
-            for ( ICECandidatePair *pOtherPair : m_vecCandidatePairs )
+            // Fast-track our own check on the pair the controlling peer just told us to use, so
+            // STUNRequestCallback_PeerConnectivityCheck's success path can switch to it as soon
+            // as it confirms.  As the controlled agent we are never the one deciding here --
+            // the controlling side's USE-CANDIDATE is authoritative, so the latest one always
+            // wins: never refuse or drop it just because some other pair is already our pending
+            // guess.  (The single-pending-nomination "don't stack" gate elsewhere is a
+            // controlling-side policy for its own nomination decisions; it doesn't apply to us
+            // just following instructions.)
+            if ( pThisPair == m_pPendingNomination )
             {
-                if (
-                    pOtherPair->m_bNominated
-                    && ( pOtherPair->m_nState == kICECandidatePairState_InProgress || pOtherPair->m_nState == kICECandidatePairState_Waiting )
-                ) {
-                    bAlreadyHaveANomination = true;
+                // A retransmitted USE-CANDIDATE for the pair we're already trying -- retrigger
+                // rather than re-arm/duplicate.
+                if ( pThisPair->m_pPeerRequest != nullptr )
+                    pThisPair->m_pPeerRequest->RetriggerNow();
+                else if ( !has_element( m_vecTriggeredCheckQueue, pThisPair ) )
+                {
+                    pThisPair->m_nState = kICECandidatePairState_Waiting;
+                    m_vecTriggeredCheckQueue.push_back( pThisPair );
                 }
             }
-
-            if ( !bAlreadyHaveANomination )
+            else
             {
+                // The controlling side has moved on to a different pair (or this is the first
+                // USE-CANDIDATE of the session) -- replace whatever we were previously trying to
+                // confirm.  Only ever touches that one prior pending pair's flag, never the
+                // whole pair list, so nothing else's nomination state is disturbed.
+                if ( m_pPendingNomination != nullptr )
+                {
+                    ICECandidatePair *pOldPending = m_pPendingNomination;
+                    pOldPending->m_bNominated = false;
+                    if ( pOldPending->m_pPeerRequest != nullptr )
+                    {
+                        find_and_remove_element( m_vecPendingPeerRequests, pOldPending->m_pPeerRequest );
+                        delete pOldPending->m_pPeerRequest;
+                        pOldPending->m_pPeerRequest = nullptr;
+
+                        // Otherwise it stays InProgress and blocks its foundation.
+                        pOldPending->m_nState = kICECandidatePairState_Waiting;
+                    }
+                    else
+                    {
+                        find_and_remove_element( m_vecTriggeredCheckQueue, pOldPending );
+                    }
+                }
+
                 pThisPair->m_bNominated = true;
+                m_pPendingNomination = pThisPair;
                 if ( pThisPair->m_pPeerRequest != nullptr )
                 {
                     Assert( pThisPair->m_nState == kICECandidatePairState_InProgress );
 
-                    // The in-flight request will call SetSelectedCandidatePair when it
-                    // succeeds; m_bNominated is now set so the callback will handle it.
                     // Retrigger rather than cancel so the existing transaction ID is preserved.
                     pThisPair->m_pPeerRequest->RetriggerNow();
                 }
@@ -2295,7 +2394,10 @@ void CSteamNetworkingICESession::Think( SteamNetworkingMicroseconds usecNow )
     // Don't start checks before we have peer candidates and the remote password --
     // we'd send unauthenticated requests and couldn't verify the response integrity.
     if ( !m_vecPeerCandidates.empty() && !m_strRemotePassword.empty() )
+    {
+        Think_PingSelectedAndBackupPairs( usecNow );
         Think_TestPeerConnectivity();
+    }
 
     Think_CheckAllCandidatesFailed( usecNow );
 }
@@ -2866,6 +2968,169 @@ void CSteamNetworkingICESession::Think_KeepAliveOnCandidates( SteamNetworkingMic
     }
 }
 
+CSteamNetworkingICESession::ICECandidatePair *CSteamNetworkingICESession::FindBestSucceededCandidatePair( const ICECandidatePair *pExclude, SteamNetworkingMicroseconds usecNow ) const
+{
+    // A backup this stale hasn't been validated recently enough to trust as an instant failover
+    // target -- WebRTC's own backup-ping interval is 25s, so anything past ~30s means we've
+    // already missed at least one scheduled backup check on it.
+    const SteamNetworkingMicroseconds k_usecMaxBackupAge = 30000 * 1000;
+
+    ICECandidatePair *pBest = nullptr;
+    for ( ICECandidatePair *pPair : m_vecCandidatePairs )
+    {
+        if ( pPair == pExclude || pPair->m_nState != kICECandidatePairState_Succeeded )
+            continue;
+        if ( usecNow - pPair->m_usecLastRecv > k_usecMaxBackupAge )
+            continue;
+        // Ranking stays same-subnet-then-priority (not recency) so a fresher relay backup can
+        // never outrank a slightly-staler-but-direct one -- direct must still beat relay.
+        if ( pBest == nullptr || pPair->BIsPreferredRouteOver( *pBest ) )
+            pBest = pPair;
+    }
+    return pBest;
+}
+
+void CSteamNetworkingICESession::TryNominateNextFailoverBackup( ICECandidatePair *pDeadPair, SteamNetworkingMicroseconds usecNow )
+{
+    ICECandidatePair *pBackup = FindBestSucceededCandidatePair( pDeadPair, usecNow );
+    if ( pBackup != nullptr )
+        ArmNomination( pBackup );
+    // else: nothing eligible left -- caller (the still-selected, still-Failed pDeadPair) just
+    // keeps retrying at the normal cadence; GNS's own end-to-end connection timeout is the
+    // backstop if nothing ever comes back.
+}
+
+void CSteamNetworkingICESession::MarkPendingNomination( ICECandidatePair *pTarget )
+{
+    // Never clear the currently-selected pair's own nomination flag here: it drives
+    // USE-CANDIDATE on its own ongoing periodic checks (see the check-builder in
+    // Think_TestPeerConnectivity), and must stay set regardless of whatever else we're trying
+    // -- e.g. a failover backup that might not pan out.  The success handler in
+    // STUNRequestCallback_PeerConnectivityCheck tells the selected pair and the pending
+    // nomination apart by identity (pPair == m_pSelectedCandidatePair / == m_pPendingNomination),
+    // not by this flag, so both may legitimately be true at once; if the pending nomination
+    // below fails, the selected pair is left exactly as nominated as it was before.
+    for ( ICECandidatePair *pOther : m_vecCandidatePairs )
+    {
+        if ( pOther != pTarget && pOther != m_pSelectedCandidatePair )
+            pOther->m_bNominated = false;
+    }
+    pTarget->m_bNominated = true;
+    m_pPendingNomination = pTarget;
+}
+
+void CSteamNetworkingICESession::ArmNomination( ICECandidatePair *pTarget )
+{
+    if ( m_pPendingNomination != nullptr && m_pPendingNomination != pTarget )
+    {
+        // Callers only arm a new nomination when m_pPendingNomination is already null in the
+        // common case (bootstrap, win-back, and the first failover attempt all check this
+        // before calling in), so reaching here with something else already pending is an edge
+        // case -- e.g. a rapid re-entrant call.  Try to make room for the new one; if the old
+        // one's check has already gone out, leave both alone rather than risk two nominations
+        // in flight at once (the old one will resolve on its own -- success switches to it,
+        // failure clears it and, if we're mid-failover, tries the next backup).
+        if ( !CancelPendingNomination() )
+            return;
+    }
+
+    if ( pTarget->m_pPeerRequest != nullptr )
+    {
+        // A non-nominated check (e.g. a backup-liveness ping) is in flight on it.  That check
+        // can't have carried USE-CANDIDATE -- it wasn't nominated when it was built and sent --
+        // so it's always safe to replace with a fresh nominated one, regardless of whether it's
+        // already been transmitted.
+        find_and_remove_element( m_vecPendingPeerRequests, pTarget->m_pPeerRequest );
+        delete pTarget->m_pPeerRequest;
+        pTarget->m_pPeerRequest = nullptr;
+    }
+
+    MarkPendingNomination( pTarget );
+    pTarget->m_nState = kICECandidatePairState_Waiting;
+    if ( !has_element( m_vecTriggeredCheckQueue, pTarget ) )
+        m_vecTriggeredCheckQueue.push_back( pTarget );
+}
+
+bool CSteamNetworkingICESession::CancelPendingNomination()
+{
+    if ( m_pPendingNomination == nullptr )
+        return true;
+
+    ICECandidatePair * const pPending = m_pPendingNomination;
+
+    // If its nominated check has already gone out, the controlled peer may have seen
+    // USE-CANDIDATE and already switched to it -- don't yank it out from under that.  Let it
+    // resolve on its own: success confirms the switch via SetSelectedCandidatePair, failure
+    // clears its own nomination there.
+    if ( pPending->m_pPeerRequest != nullptr && pPending->m_pPeerRequest->m_usecLastSentTime != 0 )
+        return false;
+
+    pPending->m_bNominated = false;
+    if ( pPending->m_pPeerRequest != nullptr )
+    {
+        find_and_remove_element( m_vecPendingPeerRequests, pPending->m_pPeerRequest );
+        delete pPending->m_pPeerRequest;
+        pPending->m_pPeerRequest = nullptr;
+
+        // Otherwise it stays InProgress and blocks its foundation.
+        pPending->m_nState = kICECandidatePairState_Waiting;
+    }
+    else
+    {
+        // Armed but not yet dequeued/sent at all -- just pull it out of the queue.
+        find_and_remove_element( m_vecTriggeredCheckQueue, pPending );
+    }
+    m_pPendingNomination = nullptr;
+    return true;
+}
+
+void CSteamNetworkingICESession::Think_PingSelectedAndBackupPairs( SteamNetworkingMicroseconds usecNow )
+{
+    // Matches WebRTC's default STRONG_AND_STABLE_WRITABLE_CONNECTION_PING_INTERVAL: how often
+    // the active path is re-checked for consent freshness (RFC 7675) and to notice quickly
+    // when it stops responding.
+    const SteamNetworkingMicroseconds k_usecSelectedPairPingInterval = 2500 * 1000;
+
+    // Matches WebRTC's default BACKUP_CONNECTION_PING_INTERVAL: how often an already-succeeded
+    // but non-selected pair is re-validated, so a warm failover target is available the moment
+    // the selected pair dies instead of having to run a fresh check from scratch.
+    const SteamNetworkingMicroseconds k_usecBackupPairPingInterval = 25000 * 1000;
+
+    for ( ICECandidatePair *pPair : m_vecCandidatePairs )
+    {
+        const bool bSelected = ( pPair == m_pSelectedCandidatePair );
+
+        // Keep retrying the active path even after it drops, in case it recovers (e.g. a brief
+        // NAT rebind) -- we may have no validated backup to fail over to.  A failed backup pair
+        // just stays parked until something else (a new peer candidate, an incoming check)
+        // revives it; endlessly re-pinging every dead backup isn't worth the traffic.
+        if ( pPair->m_nState != kICECandidatePairState_Succeeded
+            && !( bSelected && pPair->m_nState == kICECandidatePairState_Failed ) )
+            continue;
+
+        if ( pPair->m_pPeerRequest != nullptr )
+            continue; // already has a check in flight
+
+        const SteamNetworkingMicroseconds usecInterval = bSelected ? k_usecSelectedPairPingInterval : k_usecBackupPairPingInterval;
+
+        // Not yet scheduled (pair just reached this state): seed the schedule instead of
+        // firing immediately -- the check that got it here already proved it's alive.
+        if ( pPair->m_usecNextPeriodicCheck == 0 )
+        {
+            pPair->m_usecNextPeriodicCheck = usecNow + usecInterval;
+            continue;
+        }
+
+        if ( usecNow < pPair->m_usecNextPeriodicCheck )
+            continue;
+
+        pPair->m_usecNextPeriodicCheck = usecNow + usecInterval;
+        pPair->m_nState = kICECandidatePairState_Waiting;
+        if ( !has_element( m_vecTriggeredCheckQueue, pPair ) )
+            m_vecTriggeredCheckQueue.push_back( pPair );
+    }
+}
+
 void CSteamNetworkingICESession::Think_TestPeerConnectivity()
 {
 	SteamNetworkingGlobalLock::AssertHeldByCurrentThread( "CSteamNetworkingICESession::Think_TestPeerConnectivity" );
@@ -3088,49 +3353,145 @@ void CSteamNetworkingICESession::STUNRequestCallback_PeerConnectivityCheck( cons
     if ( info.m_pHeader == nullptr )
     {
         pPair->m_nState = kICECandidatePairState_Failed;
+        pPair->m_nConsecutiveSuccessfulChecks = 0;
+
+        // The currently-selected pair failing its own consent/liveness check: this is the
+        // failover decision.  Handled first and separately from the "the pending nomination
+        // itself failed" and "some other pair failed" cases below, since the selected pair
+        // stays selected (and keeps getting retried by Think_PingSelectedAndBackupPairs)
+        // regardless of the outcome here -- we only ever leave it via a *confirmed* nomination
+        // succeeding (see the success path and SetSelectedCandidatePair), never directly from
+        // a failure.
+        if ( pPair == m_pSelectedCandidatePair )
+        {
+            ++pPair->m_nConsecutiveFailedChecks;
+
+            // Only the controlling agent may switch the selected pair -- ICE nomination is a
+            // controlling-agent decision (RFC 8445 sec 8).  A controlled agent just keeps
+            // retrying its current pair and waits to be told (via USE-CANDIDATE) to switch;
+            // acting unilaterally here would let the two sides disagree on the active path.
+            //
+            // Require the path to look genuinely dead -- a couple of failed checks in a row
+            // *and* nothing at all received on it in the last 5s -- before giving up on it.
+            // One lost check response on an otherwise-fine path (e.g. data still flowing)
+            // shouldn't cause a switch.  Don't pile on if a nomination is already pending --
+            // TryNominateNextFailoverBackup (below, and from the pending-nomination-failed
+            // case) is what advances that.
+            const int k_nMinConsecutiveFailuresBeforeFailover = 2;
+            const SteamNetworkingMicroseconds k_usecSelectedPairDeadTimeout = 5000 * 1000;
+            if ( m_role == k_EICERole_Controlling
+                && m_pPendingNomination == nullptr
+                && pPair->m_nConsecutiveFailedChecks >= k_nMinConsecutiveFailuresBeforeFailover
+                && info.m_usecNow - pPair->m_usecLastRecv >= k_usecSelectedPairDeadTimeout )
+            {
+                // Arms a backup (if any) and lets its own successful, USE-CANDIDATE-bearing
+                // check select it via the normal nomination-success path below -- it never
+                // touches m_pSelectedCandidatePair itself.  If pPair recovers before that
+                // confirms, the "still selected" success case below cancels the pending
+                // nomination and we simply never switch.
+                TryNominateNextFailoverBackup( pPair, info.m_usecNow );
+                // else (no eligible backup): nothing to do here -- pPair stays selected and
+                // GNS's own end-to-end connection timeout is the backstop if it never recovers.
+            }
+
+            pPair->m_usecNextPeriodicCheck = 0; // retry (or keep retrying) at the normal cadence
+            return;
+        }
+
+        if ( pPair == m_pPendingNomination )
+        {
+            // The pending nomination's own check just failed -- it's not going to work either.
+            // Clear it and, if we're actually mid-failover (the selected pair is confirmed
+            // dead, not just being opportunistically upgraded from), immediately try the next
+            // eligible backup instead of waiting for some other backup's own ~25s liveness
+            // cadence to bring it up again.  A failed win-back or bootstrap nomination just
+            // gets dropped -- there's nothing broken to react to.
+            pPair->m_bNominated = false;
+            m_pPendingNomination = nullptr;
+            if ( m_role == k_EICERole_Controlling && m_pSelectedCandidatePair != nullptr
+                && m_pSelectedCandidatePair->m_nState == kICECandidatePairState_Failed )
+            {
+                TryNominateNextFailoverBackup( m_pSelectedCandidatePair, info.m_usecNow );
+            }
+            return;
+        }
+
+        // Some other, ordinary exploratory/backup pair failed.  If it happened to be nominated
+        // (shouldn't normally happen outside the two cases above, but be defensive), clear it
+        // so a stuck flag can't block a future nomination elsewhere.
+        pPair->m_bNominated = false;
         return;
     }
     pPair->m_nState = kICECandidatePairState_Succeeded;
+    pPair->m_usecNextPeriodicCheck = 0; // reseed the periodic re-check schedule from this success
+    pPair->m_usecLastRecv = info.m_usecNow;
+    pPair->m_nConsecutiveFailedChecks = 0;
+    ++pPair->m_nConsecutiveSuccessfulChecks;
 
-    // Don't nominate or upgrade to a pair that isn't a better route than the current
-    // selection -- it can't improve our path.  "Better" prefers same-subnet, then priority.
-    if ( m_pSelectedCandidatePair != nullptr && m_pSelectedCandidatePair != pPair
-         && !pPair->BIsPreferredRouteOver( *m_pSelectedCandidatePair ) )
+    if ( pPair == m_pSelectedCandidatePair )
     {
+        // Steady-state re-validation of the active path (the common case), or -- if a
+        // nomination is pending elsewhere -- the current pair proving it's still alive.  Only
+        // abandon that pending nomination if its own check hasn't reached the wire yet; if the
+        // peer's already seen USE-CANDIDATE for it, let it complete instead
+        // (CancelPendingNomination() itself enforces this).
+        if ( m_pPendingNomination != nullptr )
+            CancelPendingNomination();
+        return;
+    }
+
+    if ( pPair == m_pPendingNomination )
+    {
+        // The nomination we're waiting on has been confirmed -- switch now.  Always honor it
+        // regardless of how the priority comparison against the current selection reads at
+        // this instant: a failover target is deliberately *not* "preferred" over the dead pair
+        // it's replacing, so re-litigating that here would defeat the whole mechanism.
+        SetSelectedCandidatePair( pPair );
         return;
     }
 
     if ( pPair->m_bNominated )
     {
-        SetSelectedCandidatePair( pPair );
+        // Stray: nominated at some point (e.g. it was the pending nomination before being
+        // superseded) but its in-flight check outlived that.  Ignore it and clear the flag so
+        // it doesn't linger.
+        pPair->m_bNominated = false;
+        return;
     }
-	else if ( m_role == k_EICERole_Controlling )
+
+    // Not nominated and not pending: an ordinary exploratory check succeeding, or a backup's
+    // periodic liveness re-validation.  Don't spontaneously nominate/upgrade to a pair that
+    // isn't actually better than the current selection -- it can't improve our path.
+    // "Better" prefers same-subnet, then priority.
+    if ( m_pSelectedCandidatePair != nullptr && !pPair->BIsPreferredRouteOver( *m_pSelectedCandidatePair ) )
+        return;
+
+    if ( m_role != k_EICERole_Controlling )
+        return;
+
+    if ( m_pSelectedCandidatePair != nullptr )
     {
-		if ( m_pSelectedCandidatePair != nullptr
-             && pPair->BIsPreferredRouteOver( *m_pSelectedCandidatePair ) )
-		{
-			// Better path than current selection -- nominate it to trigger an upgrade.
-			pPair->m_bNominated = true;
-			if ( !has_element( m_vecTriggeredCheckQueue, pPair ) )
-				m_vecTriggeredCheckQueue.push_back( pPair );
-		}
-		else
-		{
-			// Once we have a selected pair, or any nominated pair (including ones queued
-			// but not yet sent), don't nominate more.
-			bool bAlreadyHaveANomination = ( m_pSelectedCandidatePair != nullptr );
-			for ( ICECandidatePair *pOtherPair : m_vecCandidatePairs )
-			{
-				if ( pOtherPair->m_bNominated )
-					bAlreadyHaveANomination = true;
-			}
-			if ( !bAlreadyHaveANomination )
-			{
-				pPair->m_bNominated = true;
-				if ( !has_element( m_vecTriggeredCheckQueue, pPair ) )
-					m_vecTriggeredCheckQueue.push_back( pPair );
-			}
-		}
+        // Win-back/upgrade: require the preferred pair to have proven itself over a couple of
+        // consecutive successful checks, and (only if the current pair got here via a
+        // failure-driven failover, not the initial selection or a normal upgrade -- see
+        // m_usecLastFailoverTime) a minimum dwell since that failover, before switching.  This
+        // is symmetric with the failure gate above, so two close-priority paths (e.g. a direct
+        // route that intermittently out-races a stable relay) can't flap back and forth right
+        // after a failover -- while a relay->direct upgrade at connection start isn't delayed.
+        const int k_nMinConsecutiveSuccessesBeforeWinBack = 2;
+        const SteamNetworkingMicroseconds k_usecMinDwellSinceFailover = 10000 * 1000;
+        if ( m_pPendingNomination == nullptr
+            && pPair->m_nConsecutiveSuccessfulChecks >= k_nMinConsecutiveSuccessesBeforeWinBack
+            && info.m_usecNow - m_usecLastFailoverTime >= k_usecMinDwellSinceFailover )
+        {
+            ArmNomination( pPair );
+        }
+    }
+    else if ( m_pPendingNomination == nullptr )
+    {
+        // Bootstrap: no selection yet, and nothing else pending -- nominate the first pair to
+        // succeed.
+        ArmNomination( pPair );
     }
 }
 
@@ -3302,6 +3663,10 @@ CSteamNetworkingICESession::ICECandidatePair::ICECandidatePair( const ICELocalCa
 
     m_pPeerRequest = nullptr;
 	m_nLastRecordedPing = -1;
+    m_usecNextPeriodicCheck = 0;
+    m_usecLastRecv = 0;
+    m_nConsecutiveFailedChecks = 0;
+    m_nConsecutiveSuccessfulChecks = 0;
 }
 
 /////////////////////////////////////////////////////////////////////////////

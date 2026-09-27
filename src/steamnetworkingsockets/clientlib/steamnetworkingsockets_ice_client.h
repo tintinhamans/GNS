@@ -427,6 +427,32 @@ namespace SteamNetworkingSocketsLib {
             ICEPeerCandidate m_remoteCandidate;
             CSteamNetworkingSocketsSTUNRequest *m_pPeerRequest;
 			int m_nLastRecordedPing;
+
+            // When to next re-run a connectivity check on this pair for consent freshness
+            // (selected pair) or backup liveness (succeeded, non-selected pair).  Zero means
+            // "not yet scheduled" -- the next Think_PingSelectedAndBackupPairs pass seeds it
+            // rather than firing immediately, since a pair only gets here right after a check
+            // already proved it alive.
+            SteamNetworkingMicroseconds m_usecNextPeriodicCheck;
+
+            // Wall-clock time of the last inbound packet actually seen on this exact pair's
+            // tuple -- a successful check reply (selected or backup) or, for the selected pair,
+            // any application data received on it (see OnPacketReceived).  Used together with
+            // m_nConsecutiveFailedChecks to judge whether the selected pair is genuinely dead,
+            // and to rank backups by freshness when picking a failover target.
+            SteamNetworkingMicroseconds m_usecLastRecv;
+
+            // How many consent/liveness checks on this pair have failed in a row since its
+            // last success.  Only meaningful for the selected pair's failover decision -- one
+            // lost response shouldn't cause a switch, several in a row should.
+            int m_nConsecutiveFailedChecks;
+
+            // How many consent/liveness checks on this pair have succeeded in a row since its
+            // last failure.  Used for win-back hysteresis: a pair must prove itself over a
+            // couple of checks before it's nominated to replace a selection that's still fine,
+            // symmetric with m_nConsecutiveFailedChecks gating failover the other way.
+            int m_nConsecutiveSuccessfulChecks;
+
             ICECandidatePair( const ICELocalCandidate& localCandidate, const ICEPeerCandidate& remoteCandidate, EICERole role );
 
             // Route-selection preference: prefer a same-subnet (direct LAN) pair, then higher
@@ -518,6 +544,26 @@ namespace SteamNetworkingSocketsLib {
         // in that pair, kept here to avoid the per-send lookup overhead.
         ICECandidatePair *m_pSelectedCandidatePair;
 
+        // The single pair -- whether armed by a controlling-side failover, a controlling-side
+        // win-back/upgrade, a controlling-side bootstrap nomination, or the controlled side
+        // fast-tracking its own check after the peer already sent USE-CANDIDATE -- currently
+        // awaiting its own successful check to confirm it as the (new) selection.
+        // m_pSelectedCandidatePair (if any) is deliberately left alone and kept alive/retried
+        // until this either confirms -- switching via the normal nomination-success path in
+        // STUNRequestCallback_PeerConnectivityCheck -- or is cancelled/superseded first.  Null
+        // when nothing is pending.  Exactly one pair may have m_bNominated set at a time other
+        // than the current selection itself, and this is it.
+        ICECandidatePair *m_pPendingNomination = nullptr;
+
+        // Wall-clock time of the last switch of m_pSelectedCandidatePair that replaced a pair
+        // which had actually failed (a failure-driven failover) -- not set for the initial
+        // selection or a normal opportunistic win-back/upgrade.  Used to enforce a minimum
+        // dwell time on the pair a failover just switched to before a win-back nomination is
+        // allowed to switch away from it again, so two close-priority paths can't flap back and
+        // forth right after a failover.  Zero (never failed over) trivially satisfies any dwell
+        // check, so a relay->direct upgrade right at connection start is never delayed by this.
+        SteamNetworkingMicroseconds m_usecLastFailoverTime = 0;
+
         // Local network interfaces discovered during the most recent enumeration.
         // Each entry represents one usable local address.  Rebuilt whenever
         // m_bInterfaceListStale is set.
@@ -595,6 +641,11 @@ namespace SteamNetworkingSocketsLib {
         void Think_TURNMaintenance( SteamNetworkingMicroseconds usecNow );
         void Think_TestPeerConnectivity();
 
+        // RFC 7675 consent freshness on the selected pair, plus a slower liveness ping of
+        // already-succeeded backup pairs, matching WebRTC's default ping cadence for both.
+        // Queues due pairs onto m_vecTriggeredCheckQueue for Think_TestPeerConnectivity to send.
+        void Think_PingSelectedAndBackupPairs( SteamNetworkingMicroseconds usecNow );
+
         // True once gathering has reached a terminal state (success or exhaustion) on every
         // interface for both candidate types, no DNS resolution is still pending, and every
         // formed candidate pair is Failed (none Succeeded/InProgress/Waiting/Frozen) with no
@@ -604,6 +655,36 @@ namespace SteamNetworkingSocketsLib {
         void Think_CheckAllCandidatesFailed( SteamNetworkingMicroseconds usecNow );
 
         void SetSelectedCandidatePair( ICECandidatePair *pPair );
+
+        // Best already-validated (Succeeded) pair other than pExclude, ranked the same way as
+        // check/nomination order (same-subnet first, then priority), skipping any whose last
+        // successful check is too stale to trust as an instant failover target.  Null if none.
+        ICECandidatePair *FindBestSucceededCandidatePair( const ICECandidatePair *pExclude, SteamNetworkingMicroseconds usecNow ) const;
+
+        // Look for a still-eligible backup other than pDeadPair and, if one exists, arm it as
+        // the pending nomination via ArmNomination().  No-op (selected pair just keeps
+        // retrying) if nothing eligible is left.
+        void TryNominateNextFailoverBackup( ICECandidatePair *pDeadPair, SteamNetworkingMicroseconds usecNow );
+
+        // Makes pTarget the only pending nomination; other pairs except the selection lose m_bNominated.
+        void MarkPendingNomination( ICECandidatePair *pTarget );
+
+        // Arm pTarget as the pending nomination (failover, win-back, or bootstrap): replaces
+        // any different pending nomination first (see CancelPendingNomination -- if that one's
+        // check has already gone out, this is a no-op instead of running two nominations at
+        // once), cancels/replaces any non-nominated check already in flight on pTarget itself
+        // (always safe -- it can't have carried USE-CANDIDATE), then queues a fresh nominated
+        // check.  Callers are expected to have already checked m_pPendingNomination == nullptr
+        // in the common case; this only needs to actually replace something in edge cases.
+        void ArmNomination( ICECandidatePair *pTarget );
+
+        // Abandon the in-progress pending nomination, if any: un-nominate it and cancel its
+        // check, unless that check has already been sent -- in which case the peer may already
+        // have switched to it, so it's left alone to resolve on its own instead of risking the
+        // two sides disagreeing on the active path.  Returns true if nothing was pending, or
+        // the pending nomination was successfully cancelled; false if it was left alone because
+        // its check had already gone out.
+        bool CancelPendingNomination();
 
         // Delete a candidate pair and perform all associated cleanup:
         // clears the selected-pair state if this was the active path, cancels
