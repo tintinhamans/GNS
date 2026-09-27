@@ -4121,6 +4121,8 @@ static int IPv6MaskToPrefixLen( const uint8 *pMask )
 
 #if IsWindows()
 
+static std::atomic<uint32> s_nNetworkChangeGeneration{ 0 };
+
 // Ask the OS which interface currently carries the default route toward a well-known public
 // address, for the given family.  Returns 0 if we can't determine it (missing API, no route,
 // etc) -- this is only used to rank interfaces for ICE gathering, so it's never fatal.
@@ -4199,9 +4201,43 @@ static int ClassifyAdapterKind( const IP_ADAPTER_ADDRESSES_LH *pAdapter )
 	}
 }
 
+// Fires whenever the OS reports an IP interface change (link up/down, address add/remove).
+// Used only to invalidate ICE's cached interface list; the actual regather happens on the
+// ICE session's own thread the next time it thinks, so all this needs to do is bump a counter.
+static VOID WINAPI NetworkChangeNotifyCallback( PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE )
+{
+	s_nNetworkChangeGeneration.fetch_add( 1, std::memory_order_relaxed );
+}
+
+static void EnsureNetworkChangeNotifyRegistered()
+{
+	static std::mutex s_mutex;
+	static bool s_bRegistered = false;
+
+	std::lock_guard<std::mutex> lock( s_mutex );
+	if ( s_bRegistered )
+		return;
+	s_bRegistered = true; // Only try once, even if registration fails below
+
+	// Handle is intentionally never closed -- this notification is wanted for the life of the
+	// process, same as other one-shot OS registrations in this file (e.g. the DNS threads).
+	HANDLE hNotify = nullptr;
+	NotifyIpInterfaceChange( AF_UNSPEC, NetworkChangeNotifyCallback, nullptr, FALSE, &hNotify );
+}
+
 #endif // IsWindows()
 
-bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
+uint32 GetNetworkChangeGeneration()
+{
+	#if IsWindows()
+		EnsureNetworkChangeNotifyRegistered();
+		return s_nNetworkChangeGeneration.load( std::memory_order_relaxed );
+	#else
+		return 0;
+	#endif
+}
+
+bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs, CUtlVector<SteamNetworkingIPAddr> *pAllAssignedAddrs )
 {
 
 	#if STEAMNETWORKINGSOCKETS_ENABLE_MOCK
@@ -4225,6 +4261,8 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
 					else
 						entry.m_nPrefixLen = 112;
 				}
+				if ( pAllAssignedAddrs != nullptr )
+					pAllAssignedAddrs->AddToTail( iface.m_ip );
 			}
 		}
 		return true;
@@ -4326,6 +4364,13 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
 			if ( GetLocalAddresses_IsReserved( ipAddr ) )
 				continue;
 
+			// This address is still actually assigned to the adapter, even if it's about to
+			// lose the "one per adapter" contest below (e.g. deprecated but not yet removed).
+			// Record it so a regather doesn't tear down an interface using it while it still
+			// works -- only DAD-failed (Duplicate) addresses are truly gone.
+			if ( pAllAssignedAddrs != nullptr && ( !bIsV6 || pThisAddr->DadState != IpDadStateDuplicate ) )
+				pAllAssignedAddrs->AddToTail( ipAddr );
+
 			if ( bIsV6 )
 			{
 				// Skip anything not fully usable: tentative (DAD still running), duplicate
@@ -4418,6 +4463,9 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
 		// Discard certain reserved addresses
 		if ( GetLocalAddresses_IsReserved( ipAddr ) )
 			continue;
+
+		if ( pAllAssignedAddrs != nullptr )
+			pAllAssignedAddrs->AddToTail( ipAddr );
 
 		// Got a host address, record it!
 		LocalAddress_t &entry = *pAddrs->AddToTailGetPtr();

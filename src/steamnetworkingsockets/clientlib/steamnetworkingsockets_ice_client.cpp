@@ -1725,7 +1725,8 @@ void CSteamNetworkingICESession::GatherInterfaces()
 	SteamNetworkingGlobalLock::AssertHeldByCurrentThread( "CSteamNetworkingICESession::GatherInterfaces" );
 
     CUtlVector<LocalAddress_t> vecAddrs;
-    if ( !GetLocalAddresses( &vecAddrs ) )
+    CUtlVector<SteamNetworkingIPAddr> vecAllAssignedAddrs;
+    if ( !GetLocalAddresses( &vecAddrs, &vecAllAssignedAddrs ) )
         return;
 
     m_bInterfaceListStale = false;
@@ -1755,6 +1756,47 @@ void CSteamNetworkingICESession::GatherInterfaces()
 
         if ( !bFound )
         {
+            // The interface's address didn't win the "one candidate per adapter" contest this
+            // time around (e.g. a rotating/deprecated IPv6 privacy address).  If it's still
+            // actually assigned to the host, and it's backing our selected pair or a pair that
+            // has succeeded before, leave it alone -- deprecated addresses keep working, and
+            // tearing this down would drop a connection that's otherwise fine.
+            bool bStillAssigned = false;
+            for ( const SteamNetworkingIPAddr &addr : vecAllAssignedAddrs )
+            {
+                netadr_t addrCheck;
+                SteamNetworkingIPAddrToNetAdr( addrCheck, addr );
+                if ( addrCheck.GetIP() == intf->m_boundAddr.GetIP() )
+                {
+                    bStillAssigned = true;
+                    break;
+                }
+            }
+
+            if ( bStillAssigned )
+            {
+                bool bBacksImportantPair =
+                    m_pSelectedCandidatePair != nullptr && m_pSelectedCandidatePair->m_localCandidate.m_pInterface == intf;
+                if ( !bBacksImportantPair )
+                {
+                    for ( ICECandidatePair *pPair : m_vecCandidatePairs )
+                    {
+                        if ( pPair->m_localCandidate.m_pInterface == intf && pPair->m_nState == kICECandidatePairState_Succeeded )
+                        {
+                            bBacksImportantPair = true;
+                            break;
+                        }
+                    }
+                }
+
+                if ( bBacksImportantPair )
+                {
+                    if ( intf->m_nPriority <= uNextPriority )
+                        uNextPriority = intf->m_nPriority-1;
+                    continue;
+                }
+            }
+
             // ICESessionInterface disappeared!  Delete the socket and all candidates
             // and pairs that use it
             SpewMsg( "ICE: Local interface %s removed\n", CUtlNetAdrRender( intf->m_boundAddr ).String() );
@@ -2217,6 +2259,25 @@ void CSteamNetworkingICESession::Think( SteamNetworkingMicroseconds usecNow )
     SetNextThinkTime( usecNow + SteamNetworkingMicroseconds( 50000 ) ); // 50ms think rate
 
     Think_ApplyPendingDNSResults();
+
+    // Catch OS-level network changes (Wi-Fi switch, VPN connect/disconnect, etc) that happen
+    // mid-session.  This is a cheap poll (an atomic load after the first call anywhere in the
+    // process), so it's fine to do every think tick rather than needing a callback registry.
+    // Debounced: a burst of change notifications (e.g. a VPN adapter renegotiating several
+    // times as it comes up) only triggers one regather, once the counter's been quiet a bit.
+    const SteamNetworkingMicroseconds k_usecNetworkChangeDebounce = 1 * k_nMillion;
+    const uint32 nNetworkChangeGeneration = GetNetworkChangeGeneration();
+    if ( nNetworkChangeGeneration != m_nLastSeenNetworkChangeGeneration )
+    {
+        m_nLastSeenNetworkChangeGeneration = nNetworkChangeGeneration;
+        m_usecNetworkChangeGenerationChangedAt = usecNow;
+    }
+    else if ( nNetworkChangeGeneration != m_nLastAppliedNetworkChangeGeneration
+        && usecNow - m_usecNetworkChangeGenerationChangedAt >= k_usecNetworkChangeDebounce )
+    {
+        m_nLastAppliedNetworkChangeGeneration = nNetworkChangeGeneration;
+        InvalidateInterfaceList();
+    }
 
     if ( m_bInterfaceListStale )
     {
