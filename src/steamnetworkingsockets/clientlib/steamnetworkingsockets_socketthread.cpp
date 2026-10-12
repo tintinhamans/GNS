@@ -3874,10 +3874,6 @@ void SteamNetworkingSocketsLowLevelDecRef()
 	if ( s_pServiceThread )
 		StopServiceThread();
 
-	#ifdef STEAMNETWORKINGSOCKETS_ENABLE_ICE
-		JoinICEDNSThreads();
-	#endif
-
 	#if IsWindows()
 		NetworkChangeNotifyShutdown();
 	#endif

@@ -1318,42 +1318,6 @@ struct ICEDNSResolveState
 	std::atomic<bool> m_bDone{ false };         // Set after the last entry is in m_vecResolved
 };
 
-using ICEDNSThreads = std_vector< std::pair< std::thread, std::shared_ptr<ICEDNSResolveState> > >;
-
-// Leaked on purpose: joinable threads would terminate at exit.
-static std::mutex s_mutexDNSThreads;
-static ICEDNSThreads &s_vecDNSThreads = *new ICEDNSThreads;
-
-static void AddICEDNSThread( std::thread thread, std::shared_ptr<ICEDNSResolveState> pState )
-{
-	std::lock_guard<std::mutex> lock( s_mutexDNSThreads );
-	for ( auto it = s_vecDNSThreads.begin(); it != s_vecDNSThreads.end(); )
-	{
-		if ( it->second->m_bDone )
-		{
-			it->first.join();
-			it = s_vecDNSThreads.erase( it );
-		}
-		else
-		{
-			++it;
-		}
-	}
-	s_vecDNSThreads.emplace_back( std::move( thread ), std::move( pState ) );
-}
-
-// Lookups cannot be cancelled, so this blocks until any in flight return.
-void JoinICEDNSThreads()
-{
-	ICEDNSThreads vecThreads;
-	{
-		std::lock_guard<std::mutex> lock( s_mutexDNSThreads );
-		vecThreads.swap( s_vecDNSThreads );
-	}
-	for ( auto &thread : vecThreads )
-		thread.first.join();
-}
-
 static void ResolveServerEntry( ICEServerEntry &entry )
 {
 	CUtlVector< SteamNetworkingIPAddr > vecResolved;
@@ -1548,8 +1512,10 @@ CSteamNetworkingICESession::CSteamNetworkingICESession( const ICESessionConfig& 
 		AddServers( vecLiteralEntries );
 	if ( !vecHostnameEntries.empty() )
 	{
+		// A lookup can't be cancelled, so nothing waits for the worker: it owns a reference
+		// to the state it writes and is left to finish on its own, even past this session.
 		m_pDNSResolveState = std::make_shared<ICEDNSResolveState>();
-		AddICEDNSThread( std::thread( RunICEDNSResolveWorker, m_pDNSResolveState, std::move( vecHostnameEntries ) ), m_pDNSResolveState );
+		std::thread( RunICEDNSResolveWorker, m_pDNSResolveState, std::move( vecHostnameEntries ) ).detach();
 	}
 
 	// Start from the current count so an earlier change in the process doesn't look new.

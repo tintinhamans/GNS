@@ -357,11 +357,6 @@ extern bool ResolveHostname( const char* pszHostname, CUtlVector< SteamNetworkin
 /// change, matching current behavior.
 extern uint32 GetNetworkChangeGeneration();
 
-#ifdef STEAMNETWORKINGSOCKETS_ENABLE_ICE
-/// Wait for ICE STUN/TURN hostname lookups that are still running.
-extern void JoinICEDNSThreads();
-#endif
-
 // Coarse adapter kind, used to rank local interfaces when we have more than one to choose
 // from.  Higher value == generally better for real-world connectivity.  Virtual adapters
 // (VPN/tunnel/tap) rank lowest but are never dropped -- players legitimately connect over
