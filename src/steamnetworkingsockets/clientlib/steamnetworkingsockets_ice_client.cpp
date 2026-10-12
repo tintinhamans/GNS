@@ -2602,10 +2602,12 @@ void CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay( const RecvST
 
         // Auth challenge -- 401 the first time we present no credentials, 438 if our nonce
         // went stale after we did.  Both mean: fetch a fresh nonce and retry once.
+        // A 401 to a request that already carried credentials means they are wrong.
         const STUNAttribute *pErrorAttr = FindAttributeOfType( info.m_pAttributes, info.m_nAttributes, k_nSTUN_Attr_ErrorCode );
         const int nErrorCode = GetSTUNErrorCode( pErrorAttr );
+        const bool bSentCredentials = !info.m_pRequest->m_strTURNRealm.empty();
         if ( !bAlreadyWon
-            && ( nErrorCode == k_nTURNErrorCode_Unauthorized || nErrorCode == k_nTURNErrorCode_StaleNonce )
+            && ( nErrorCode == k_nTURNErrorCode_StaleNonce || ( nErrorCode == k_nTURNErrorCode_Unauthorized && !bSentCredentials ) )
             && info.m_pRequest->m_nAuthRetriesUsed < 2
             && nSrvIdx >= 0 && nSrvIdx < len( m_vecTURNCredentials ) )
         {
