@@ -2735,14 +2735,17 @@ void CSteamNetworkingICESession::STUNRequestCallback_RefreshAllocation( const Re
         // Else: a non-recoverable error response.  Fall through to teardown below.
     }
 
-    // Timed out, or a non-recoverable error -- the kept allocation is lost.  Fail over:
-    // tear down relay state and remove all candidate pairs that depended on it (this only
-    // touches relay pairs on this interface; a selected direct/srflx pair elsewhere is
-    // untouched), then let Think_DiscoverRelayCandidate re-race every TURN server of our
-    // family and advertise whatever new relay candidate wins, same as initial discovery.
+    // Timed out, or a non-recoverable error -- the kept allocation is lost.
     SpewMsg( "ICE: TURN Refresh failed for %s -- failing over to another TURN server\n",
         CUtlNetAdrRender( pIntf->m_addrTURNServer ).String() );
+    FailOverRelay( pIntf );
+}
 
+void CSteamNetworkingICESession::FailOverRelay( ICESessionInterface *pIntf )
+{
+    // Remove the pairs that depended on this relay, then let Think_DiscoverRelayCandidate
+    // race every TURN server of our family again and advertise whatever wins, same as
+    // initial discovery.
     for ( int j = len( m_vecCandidatePairs ) - 1; j >= 0; --j )
     {
         ICECandidatePair *pPair = m_vecCandidatePairs[j];
@@ -2761,8 +2764,9 @@ void CSteamNetworkingICESession::STUNRequestCallback_RefreshAllocation( const Re
     pIntf->m_strTURNNonce.clear();     // re-authenticates from scratch with whichever
     V_memset( pIntf->m_arrTURNKey, 0, sizeof( pIntf->m_arrTURNKey ) ); // server wins next
     pIntf->m_nTURNServersDispatched = 0; // re-race all servers, not just resume past the old one
-    // Leave m_bRelayFailed = false so Think_DiscoverRelayCandidate retries right away.
     pIntf->m_usecNextAllocateDispatch = 0;
+    pIntf->m_nCreatePermissionAuthRetries = 0;
+    pIntf->m_bRelayFailed = false; // so Think_DiscoverRelayCandidate retries right away
 }
 
 void CSteamNetworkingICESession::Think_TURNMaintenance( SteamNetworkingMicroseconds usecNow )
@@ -2903,16 +2907,26 @@ void CSteamNetworkingICESession::STUNRequestCallback_CreatePermission( const Rec
     {
         // Refresh our nonce (and key) for next time.  Leave m_nTURNPermissionRevision stale
         // so Think_TURNMaintenance retries next tick, automatically picking up the new
-        // credentials since it reads them fresh from the interface each time.
+        // credentials since it reads them fresh from the interface each time.  Bounded the
+        // same way as the Allocate and Refresh retries: a relay that keeps rejecting our
+        // credentials can't forward anything, so fail it over rather than ask forever.
         const int nSrvIdx = index_of( m_vecTURNServers, pIntf->m_addrTURNServer );
-        if ( nSrvIdx >= 0 )
+        if ( pIntf->m_nCreatePermissionAuthRetries < 2 && nSrvIdx >= 0 )
         {
             const TURNCredentials &cred = m_vecTURNCredentials[ nSrvIdx ];
-            if ( !cred.m_strUsername.empty() )
-                ExtractTURNChallenge( info, cred.m_strUsername, cred.m_strPassword, pIntf->m_strTURNRealm, pIntf->m_strTURNNonce, pIntf->m_arrTURNKey );
+            if ( !cred.m_strUsername.empty()
+                && ExtractTURNChallenge( info, cred.m_strUsername, cred.m_strPassword, pIntf->m_strTURNRealm, pIntf->m_strTURNNonce, pIntf->m_arrTURNKey ) )
+            {
+                ++pIntf->m_nCreatePermissionAuthRetries;
+                return;
+            }
         }
+        SpewMsg( "ICE: TURN server %s keeps rejecting CreatePermission (%d)\n",
+            CUtlNetAdrRender( pIntf->m_addrTURNServer ).String(), nErrorCode );
+        FailOverRelay( pIntf );
         return;
     }
+    pIntf->m_nCreatePermissionAuthRetries = 0;
 
     // Advance to the revision that was current when we sent this request.
     // If more IPs arrived while the request was in flight, the revision will still be

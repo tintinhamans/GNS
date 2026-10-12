@@ -126,6 +126,10 @@ namespace SteamNetworkingSocketsLib {
         // reply or the retry schedule ends them on their own.
         std_vector< CSteamNetworkingSocketsSTUNRequest* > m_vecPendingReleaseRequests;
 
+        // Consecutive CreatePermission requests rejected with an auth challenge.  Bounded
+        // like the Allocate and Refresh retries; past the cap the relay is failed over.
+        int m_nCreatePermissionAuthRetries = 0;
+
         // Server-reflexive discovery results.  m_addrSTUNServer is also used
         // as a "discovery complete" signal: it is all-zeros until a terminal
         // result (success, no-NAT, or timeout) has been recorded.
@@ -652,6 +656,10 @@ namespace SteamNetworkingSocketsLib {
         void Think_DiscoverRelayCandidate( SteamNetworkingMicroseconds usecNow );
         void Think_TURNMaintenance( SteamNetworkingMicroseconds usecNow );
 
+        // Drop the relay allocation this interface holds (lost, or no longer usable) and every
+        // pair that depended on it, then let Think_DiscoverRelayCandidate race the TURN servers
+        // again from scratch.  A selected direct/srflx pair on another interface is untouched.
+        void FailOverRelay( ICESessionInterface *pIntf );
         void Think_TestPeerConnectivity();
 
         // RFC 7675 consent freshness on the selected pair, plus a slower liveness ping of
