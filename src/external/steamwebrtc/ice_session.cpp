@@ -76,42 +76,6 @@ struct AsyncResolverState
 	std::atomic<bool> finished{ false }; // Only set while holding mutex
 };
 
-using ResolverThreads = std::vector< std::pair< std::thread, std::shared_ptr<AsyncResolverState> > >;
-
-// Workers still running when their resolver was destroyed. Joined when the last session goes away.
-// Leaked on purpose: joinable threads would terminate at exit.
-std::mutex s_mutexResolverThreads;
-ResolverThreads &s_vecResolverThreads = *new ResolverThreads;
-
-void AbandonResolverThread( std::thread thread, std::shared_ptr<AsyncResolverState> state )
-{
-	std::lock_guard<std::mutex> lock( s_mutexResolverThreads );
-	for ( auto it = s_vecResolverThreads.begin(); it != s_vecResolverThreads.end(); )
-	{
-		if ( it->second->finished )
-		{
-			it->first.join();
-			it = s_vecResolverThreads.erase( it );
-		}
-		else
-		{
-			++it;
-		}
-	}
-	s_vecResolverThreads.emplace_back( std::move( thread ), std::move( state ) );
-}
-
-void JoinResolverThreads()
-{
-	ResolverThreads threads;
-	{
-		std::lock_guard<std::mutex> lock( s_mutexResolverThreads );
-		threads.swap( s_vecResolverThreads );
-	}
-	for ( auto &thread : threads )
-		thread.first.join();
-}
-
 // Unlike rtc::AsyncResolver, the worker thread exits as soon as the lookup is done.
 class CAsyncResolver final : public rtc::AsyncResolverInterface
 {
@@ -175,11 +139,14 @@ public:
 
 		if ( worker_.joinable() )
 		{
-			// A finished worker is only returning, so joining it doesn't block.
+			// A finished worker is only returning, so joining it doesn't block.  One still
+			// inside the lookup can't be cancelled; it is left to finish on its own.  With
+			// alive cleared it touches nothing but its own shared state before returning,
+			// so nothing waits on it: not this call, not the last session's teardown.
 			if ( wait || state_->finished )
 				worker_.join();
 			else
-				AbandonResolverThread( std::move( worker_ ), state_ );
+				worker_.detach();
 		}
 
 		// Called from a SignalDone handler: ResolveDone() deletes us after the signal.
@@ -364,8 +331,7 @@ CICESession::~CICESession()
 	s_pSocketThread->Invoke<void>( RTC_FROM_HERE, rtc::Bind( &CICESession::DestroyOnSocketThread, this ) );
 
 	s_mutex.lock();
-	bool bLastSession = --s_nInstaneCount == 0;
-	if ( bLastSession )
+	if ( --s_nInstaneCount == 0 )
 	{
 		s_pSocketThread->Quit();
 		delete s_pSocketThread;
@@ -377,10 +343,6 @@ CICESession::~CICESession()
 		rtc::CleanupSSL();
 	}
 	s_mutex.unlock();
-
-	// Outside s_mutex so a hung lookup doesn't block session creation.
-	if ( bLastSession )
-		JoinResolverThreads();
 }
 
 
