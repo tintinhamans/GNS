@@ -115,6 +115,12 @@ namespace SteamNetworkingSocketsLib {
         // Allocate request for, from this interface.  See m_nSTUNServersDispatched.
         int m_nTURNServersDispatched = 0;
 
+        // Earliest time the next Allocate may be dispatched from this interface.  Unlike
+        // STUN bindings, every Allocate that reaches a server creates state there, so the
+        // servers are tried a short stagger apart rather than all at once; a winner stops
+        // the rest from ever being sent.
+        SteamNetworkingMicroseconds m_usecNextAllocateDispatch = 0;
+
         // Server-reflexive discovery results.  m_addrSTUNServer is also used
         // as a "discovery complete" signal: it is all-zeros until a terminal
         // result (success, no-NAT, or timeout) has been recorded.
@@ -638,8 +644,9 @@ namespace SteamNetworkingSocketsLib {
 
         void Think_KeepAliveOnCandidates( SteamNetworkingMicroseconds usecNow );
         void Think_DiscoverServerReflexiveCandidates();
-        void Think_DiscoverRelayCandidate();
+        void Think_DiscoverRelayCandidate( SteamNetworkingMicroseconds usecNow );
         void Think_TURNMaintenance( SteamNetworkingMicroseconds usecNow );
+
         void Think_TestPeerConnectivity();
 
         // RFC 7675 consent freshness on the selected pair, plus a slower liveness ping of

@@ -2405,7 +2405,7 @@ void CSteamNetworkingICESession::Think( SteamNetworkingMicroseconds usecNow )
 
     Think_KeepAliveOnCandidates( usecNow );
     Think_DiscoverServerReflexiveCandidates();
-    Think_DiscoverRelayCandidate();
+    Think_DiscoverRelayCandidate( usecNow );
     Think_TURNMaintenance( usecNow );
 
     // Don't start checks before we have peer candidates and the remote password --
@@ -2520,7 +2520,13 @@ void CSteamNetworkingICESession::Think_DiscoverServerReflexiveCandidates()
     }
 }
 
-void CSteamNetworkingICESession::Think_DiscoverRelayCandidate()
+// Every Allocate that reaches a server creates an allocation there, and a loser's has to
+// be released again.  So rather than hitting every server at once, give each one this
+// long to answer before the next is tried; a winner stops the rest from being sent.
+// Still far quicker than waiting out a dead server's full retry schedule (~5.3 s).
+static const SteamNetworkingMicroseconds k_usecAllocateDispatchStagger = 500 * 1000;
+
+void CSteamNetworkingICESession::Think_DiscoverRelayCandidate( SteamNetworkingMicroseconds usecNow )
 {
     if ( m_vecTURNServers.empty() )
         return;
@@ -2532,20 +2538,26 @@ void CSteamNetworkingICESession::Think_DiscoverRelayCandidate()
         // Already have a working allocation?  Nothing left to do.
         if ( pIntf->m_addrTURNServer.IsValid() && !pIntf->m_bRelayFailed )
             continue;
-        // Exhausted every server we know about, and none resolved since?  Wait for a late
-        // DNS result (or a future failover -- see STUNRequestCallback_RefreshAllocation) to
-        // reset m_nTURNServersDispatched before trying again.
-        if ( pIntf->m_nTURNServersDispatched >= len( m_vecTURNServers ) )
-            continue;
 
-        // Race an Allocate request against every not-yet-tried server of our family,
-        // concurrently with each other and with server-reflexive discovery above.
-        for ( int idx = pIntf->m_nTURNServersDispatched; idx < len( m_vecTURNServers ); ++idx )
+        // Dispatch the next not-yet-tried server of our family.  Only servers beyond what
+        // we've already dispatched are considered, so this also picks up servers resolved
+        // after this interface started (or exhausted) its list, and a failover resets the
+        // count to try them all again.
+        while ( pIntf->m_nTURNServersDispatched < len( m_vecTURNServers ) )
         {
-            if ( m_vecTURNServers[idx].GetType() == pIntf->m_boundAddr.GetType() )
-                pIntf->QueueAllocateDiscoveryRequest( idx, nullptr, nullptr, nullptr );
+            const int idx = pIntf->m_nTURNServersDispatched;
+            if ( m_vecTURNServers[idx].GetType() != pIntf->m_boundAddr.GetType() )
+            {
+                ++pIntf->m_nTURNServersDispatched;
+                continue;
+            }
+            if ( !pIntf->m_vecPendingAllocateRequests.empty() && usecNow < pIntf->m_usecNextAllocateDispatch )
+                break;
+            pIntf->QueueAllocateDiscoveryRequest( idx, nullptr, nullptr, nullptr );
+            ++pIntf->m_nTURNServersDispatched;
+            pIntf->m_usecNextAllocateDispatch = usecNow + k_usecAllocateDispatchStagger;
+            break;
         }
-        pIntf->m_nTURNServersDispatched = len( m_vecTURNServers );
     }
 }
 
@@ -2625,6 +2637,7 @@ void CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay( const RecvST
                         nErrorCode == k_nTURNErrorCode_StaleNonce ? "refreshed" : "long-term", cred.m_strUsername.c_str() );
 
                     pIntf->QueueAllocateDiscoveryRequest( nSrvIdx, &strRealm, &strNonce, arrKey, info.m_pRequest->m_nAuthRetriesUsed + 1 );
+                    pIntf->m_usecNextAllocateDispatch = info.m_usecNow + k_usecAllocateDispatchStagger; // the server answered; give the retry its own turn
                     return;
                 }
             }
@@ -2647,6 +2660,7 @@ void CSteamNetworkingICESession::STUNRequestCallback_AllocateRelay( const RecvST
                 bWasAuthenticated ? &info.m_pRequest->m_strTURNNonce : nullptr,
                 bWasAuthenticated ? info.m_pRequest->m_arrTURNKey : nullptr,
                 info.m_pRequest->m_nAuthRetriesUsed, /*bForceIPv4Relay=*/true );
+            pIntf->m_usecNextAllocateDispatch = info.m_usecNow + k_usecAllocateDispatchStagger;
             return;
         }
 
@@ -2741,6 +2755,7 @@ void CSteamNetworkingICESession::STUNRequestCallback_RefreshAllocation( const Re
     V_memset( pIntf->m_arrTURNKey, 0, sizeof( pIntf->m_arrTURNKey ) ); // server wins next
     pIntf->m_nTURNServersDispatched = 0; // re-race all servers, not just resume past the old one
     // Leave m_bRelayFailed = false so Think_DiscoverRelayCandidate retries right away.
+    pIntf->m_usecNextAllocateDispatch = 0;
 }
 
 void CSteamNetworkingICESession::Think_TURNMaintenance( SteamNetworkingMicroseconds usecNow )
