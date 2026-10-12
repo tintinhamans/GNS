@@ -3166,17 +3166,18 @@ bool CSteamNetworkingICESession::CancelPendingNomination()
     return true;
 }
 
+// Matches WebRTC's default STRONG_AND_STABLE_WRITABLE_CONNECTION_PING_INTERVAL: how often
+// the active path is re-checked for consent freshness (RFC 7675) and to notice quickly
+// when it stops responding.
+static const SteamNetworkingMicroseconds k_usecSelectedPairPingInterval = 2500 * 1000;
+
+// Matches WebRTC's default BACKUP_CONNECTION_PING_INTERVAL: how often an already-succeeded
+// but non-selected pair is re-validated, so a warm failover target is available the moment
+// the selected pair dies instead of having to run a fresh check from scratch.
+static const SteamNetworkingMicroseconds k_usecBackupPairPingInterval = 25000 * 1000;
+
 void CSteamNetworkingICESession::Think_PingSelectedAndBackupPairs( SteamNetworkingMicroseconds usecNow )
 {
-    // Matches WebRTC's default STRONG_AND_STABLE_WRITABLE_CONNECTION_PING_INTERVAL: how often
-    // the active path is re-checked for consent freshness (RFC 7675) and to notice quickly
-    // when it stops responding.
-    const SteamNetworkingMicroseconds k_usecSelectedPairPingInterval = 2500 * 1000;
-
-    // Matches WebRTC's default BACKUP_CONNECTION_PING_INTERVAL: how often an already-succeeded
-    // but non-selected pair is re-validated, so a warm failover target is available the moment
-    // the selected pair dies instead of having to run a fresh check from scratch.
-    const SteamNetworkingMicroseconds k_usecBackupPairPingInterval = 25000 * 1000;
 
     for ( ICECandidatePair *pPair : m_vecCandidatePairs )
     {
@@ -3553,21 +3554,28 @@ void CSteamNetworkingICESession::STUNRequestCallback_PeerConnectivityCheck( cons
 
     if ( m_pSelectedCandidatePair != nullptr )
     {
-        // Win-back/upgrade: require the preferred pair to have proven itself over a couple of
-        // consecutive successful checks, and (only if the current pair got here via a
-        // failure-driven failover, not the initial selection or a normal upgrade -- see
-        // m_usecLastFailoverTime) a minimum dwell since that failover, before switching.  This
-        // is symmetric with the failure gate above, so two close-priority paths (e.g. a direct
-        // route that intermittently out-races a stable relay) can't flap back and forth right
-        // after a failover -- while a relay->direct upgrade at connection start isn't delayed.
-        const int k_nMinConsecutiveSuccessesBeforeWinBack = 2;
+        // Upgrade to a better path.  Normally the first success is enough, so a relay->direct
+        // upgrade at connection start happens as soon as the direct pair checks out.  Right
+        // after a failure-driven failover (see m_usecLastFailoverTime) the bar is higher: the
+        // preferred pair must prove itself over two consecutive checks, with a minimum dwell
+        // on the pair we failed over to, so two close-priority paths (e.g. a direct route
+        // that intermittently out-races a stable relay) can't flap back and forth.
+        const SteamNetworkingMicroseconds k_usecWinBackCautionWindow = 30000 * 1000;
         const SteamNetworkingMicroseconds k_usecMinDwellSinceFailover = 10000 * 1000;
-        if ( m_pPendingNomination == nullptr
-            && pPair->m_nConsecutiveSuccessfulChecks >= k_nMinConsecutiveSuccessesBeforeWinBack
-            && info.m_usecNow - m_usecLastFailoverTime >= k_usecMinDwellSinceFailover )
+        const bool bRecentFailover = m_usecLastFailoverTime != 0 && info.m_usecNow - m_usecLastFailoverTime < k_usecWinBackCautionWindow;
+        const int nRequiredSuccesses = bRecentFailover ? 2 : 1;
+        if ( m_pPendingNomination != nullptr )
+            return;
+        if ( pPair->m_nConsecutiveSuccessfulChecks < nRequiredSuccesses )
         {
-            ArmNomination( pPair );
+            // Re-check at the selected-pair cadence instead of the backup one, so the
+            // second success is a few seconds away rather than a backup-ping interval.
+            pPair->m_usecNextPeriodicCheck = info.m_usecNow + k_usecSelectedPairPingInterval;
+            return;
         }
+        if ( bRecentFailover && info.m_usecNow - m_usecLastFailoverTime < k_usecMinDwellSinceFailover )
+            return;
+        ArmNomination( pPair );
     }
     else if ( m_pPendingNomination == nullptr )
     {
