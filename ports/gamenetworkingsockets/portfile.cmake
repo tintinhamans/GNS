@@ -2,9 +2,9 @@
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO tintinhamans/GNS
-    REF "fa5fd2dcb396510d3d3f56fac34b0f6410b57a8b" # ice-webrtc-parity
-    SHA512 fe023a7c41aa33cd272c62a925b6e5b1f61d92cf18d844a6d67f8bf4b0520b39e46019b5b63d81cd715344a8dfc6b3ce274f223fcbb8eb8a07f91da9858c7591
-    HEAD_REF ice-webrtc-parity
+    REF "d2837fac6aa4329f96887b71929e6799e9bcc1ac" # gameclient: v1.6.1 + ICE fixes
+    SHA512 ef7036fc93ce9aae7c2138e5f455d50410e33ab61369e31ae4f54e6bb442dbb95b818c8c18a576c787e717adb5ae6d4084c89f48cd45778365f6cf0571883b2c
+    HEAD_REF gameclient
 )
 
 vcpkg_check_features(
