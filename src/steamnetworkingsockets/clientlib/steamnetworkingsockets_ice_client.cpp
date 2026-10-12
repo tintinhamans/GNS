@@ -1482,6 +1482,8 @@ CSteamNetworkingICESession::CSteamNetworkingICESession( EICERole role, CSteamNet
     m_pSelectedCandidatePair = nullptr;
     m_vecInterfaces.reserve( 16 );
 	m_nPermittedCandidateTypes = k_EICECandidate_Any;
+	m_nLastSeenNetworkChangeGeneration = GetNetworkChangeGeneration();
+	m_nLastAppliedNetworkChangeGeneration = m_nLastSeenNetworkChangeGeneration;
 }
 
 CSteamNetworkingICESession::CSteamNetworkingICESession( const ICESessionConfig& cfg, CSteamNetworkingICESessionCallbacks *pCallbacks )
@@ -1549,6 +1551,10 @@ CSteamNetworkingICESession::CSteamNetworkingICESession( const ICESessionConfig& 
 		m_pDNSResolveState = std::make_shared<ICEDNSResolveState>();
 		AddICEDNSThread( std::thread( RunICEDNSResolveWorker, m_pDNSResolveState, std::move( vecHostnameEntries ) ), m_pDNSResolveState );
 	}
+
+	// Start from the current count so an earlier change in the process doesn't look new.
+	m_nLastSeenNetworkChangeGeneration = GetNetworkChangeGeneration();
+	m_nLastAppliedNetworkChangeGeneration = m_nLastSeenNetworkChangeGeneration;
 
 	m_nPermittedCandidateTypes = cfg.m_nCandidateTypes;
 	m_strLocalUsernameFragment = cfg.m_pszLocalUserFrag;
