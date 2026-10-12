@@ -3848,6 +3848,10 @@ bool BSteamNetworkingSocketsLowLevelAddRef( SteamNetworkingErrMsg &errMsg )
 	return true;
 }
 
+#if IsWindows()
+static void NetworkChangeNotifyShutdown();
+#endif
+
 void SteamNetworkingSocketsLowLevelDecRef()
 {
 	SteamNetworkingGlobalLock::AssertHeldByCurrentThread();
@@ -3872,6 +3876,10 @@ void SteamNetworkingSocketsLowLevelDecRef()
 
 	#ifdef STEAMNETWORKINGSOCKETS_ENABLE_ICE
 		JoinICEDNSThreads();
+	#endif
+
+	#if IsWindows()
+		NetworkChangeNotifyShutdown();
 	#endif
 
 	// Destory wake communication objects
@@ -4212,20 +4220,33 @@ static VOID WINAPI NetworkChangeNotifyCallback( PVOID, PMIB_IPINTERFACE_ROW, MIB
 	s_nNetworkChangeGeneration.fetch_add( 1, std::memory_order_relaxed );
 }
 
+static std::mutex s_mutexNetworkChangeNotify;
+static std::atomic<bool> s_bNetworkChangeNotifyRegistered{ false };
+static HANDLE s_hNetworkChangeNotify = nullptr;
+
 static void EnsureNetworkChangeNotifyRegistered()
 {
-	static std::mutex s_mutex;
-	static bool s_bRegistered = false;
-
-	std::lock_guard<std::mutex> lock( s_mutex );
-	if ( s_bRegistered )
+	std::lock_guard<std::mutex> lock( s_mutexNetworkChangeNotify );
+	if ( s_bNetworkChangeNotifyRegistered.load( std::memory_order_relaxed ) )
 		return;
-	s_bRegistered = true; // Only try once, even if registration fails below
 
-	// Handle is intentionally never closed -- this notification is wanted for the life of the
-	// process, same as other one-shot OS registrations in this file (e.g. the DNS threads).
-	HANDLE hNotify = nullptr;
-	NotifyIpInterfaceChange( AF_UNSPEC, NetworkChangeNotifyCallback, nullptr, FALSE, &hNotify );
+	// Registered once per library lifetime (see NetworkChangeNotifyShutdown), and only
+	// tried once even if it fails.
+	NotifyIpInterfaceChange( AF_UNSPEC, NetworkChangeNotifyCallback, nullptr, FALSE, &s_hNetworkChangeNotify );
+	s_bNetworkChangeNotifyRegistered.store( true, std::memory_order_release );
+}
+
+// The callback points into this library, so it must be gone before the library can be.
+// CancelMibChangeNotify2 returns only once no callback is still running.
+static void NetworkChangeNotifyShutdown()
+{
+	std::lock_guard<std::mutex> lock( s_mutexNetworkChangeNotify );
+	if ( s_hNetworkChangeNotify != nullptr )
+	{
+		CancelMibChangeNotify2( s_hNetworkChangeNotify );
+		s_hNetworkChangeNotify = nullptr;
+	}
+	s_bNetworkChangeNotifyRegistered.store( false, std::memory_order_release );
 }
 
 #endif // IsWindows()
@@ -4233,7 +4254,8 @@ static void EnsureNetworkChangeNotifyRegistered()
 uint32 GetNetworkChangeGeneration()
 {
 	#if IsWindows()
-		EnsureNetworkChangeNotifyRegistered();
+		if ( !s_bNetworkChangeNotifyRegistered.load( std::memory_order_acquire ) )
+			EnsureNetworkChangeNotifyRegistered();
 		return s_nNetworkChangeGeneration.load( std::memory_order_relaxed );
 	#else
 		return 0;
