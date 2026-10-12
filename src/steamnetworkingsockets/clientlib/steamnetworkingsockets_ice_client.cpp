@@ -2498,15 +2498,20 @@ bool CSteamNetworkingICESession::BAllCandidatesExhausted( SteamNetworkingMicrose
     {
         if ( ( m_nPermittedCandidateTypes & k_EICECandidate_Any_Reflexive ) && !m_vecSTUNServers.empty() )
         {
+            // Exhausted once every server has been tried and failed, or once there is
+            // nothing left to try: an interface whose family no server matches never
+            // sends a request, and must not keep the whole session from concluding.
             bool bDone      = pIntf->m_addrSTUNServer.IsValid() && !pIntf->m_bServerReflexiveFailed;
-            bool bExhausted = pIntf->m_bServerReflexiveFailed && pIntf->m_nSTUNServersDispatched >= len( m_vecSTUNServers );
+            bool bExhausted = pIntf->m_nSTUNServersDispatched >= len( m_vecSTUNServers )
+                && ( pIntf->m_bServerReflexiveFailed || ( !pIntf->m_addrSTUNServer.IsValid() && pIntf->m_vecPendingSrflxRequests.empty() ) );
             if ( !bDone && !bExhausted )
                 return false;
         }
         if ( ( m_nPermittedCandidateTypes & k_EICECandidate_Any_Relay ) && !m_vecTURNServers.empty() )
         {
             bool bDone      = pIntf->m_addrTURNServer.IsValid() && !pIntf->m_bRelayFailed;
-            bool bExhausted = pIntf->m_bRelayFailed && pIntf->m_nTURNServersDispatched >= len( m_vecTURNServers );
+            bool bExhausted = pIntf->m_nTURNServersDispatched >= len( m_vecTURNServers )
+                && ( pIntf->m_bRelayFailed || ( !pIntf->m_addrTURNServer.IsValid() && pIntf->m_vecPendingAllocateRequests.empty() ) );
             if ( !bDone && !bExhausted )
                 return false;
         }
