@@ -602,6 +602,8 @@ namespace SteamNetworkingSocketsLib {
         // really happen in production environments, it's only in weird test situations
         bool m_bAnyTURNServerLANAddress = false;
 
+        // Non-null while a background lookup is still running for some of the configured
+        // servers.  Entries are handed over as each lookup completes, in configured order.
         std::shared_ptr<ICEDNSResolveState> m_pDNSResolveState;
         void AddServers( std_vector< ICEServerEntry > &vecEntries );
         void Think_ApplyPendingDNSResults();

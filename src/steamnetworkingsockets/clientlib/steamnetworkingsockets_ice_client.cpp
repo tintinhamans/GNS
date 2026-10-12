@@ -1313,8 +1313,9 @@ struct ICEServerEntry
 
 struct ICEDNSResolveState
 {
-	std_vector< ICEServerEntry > m_vecEntries; // Written by the worker before m_bDone is set
-	std::atomic<bool> m_bDone{ false };
+	std::mutex m_mutex;
+	std_vector< ICEServerEntry > m_vecResolved; // Handed over by the worker as each lookup completes
+	std::atomic<bool> m_bDone{ false };         // Set after the last entry is in m_vecResolved
 };
 
 using ICEDNSThreads = std_vector< std::pair< std::thread, std::shared_ptr<ICEDNSResolveState> > >;
@@ -1353,26 +1354,62 @@ void JoinICEDNSThreads()
 		thread.first.join();
 }
 
-static void ResolveServers( std_vector< ICEServerEntry > &vecEntries )
+static void ResolveServerEntry( ICEServerEntry &entry )
 {
-	for ( ICEServerEntry &entry : vecEntries )
+	CUtlVector< SteamNetworkingIPAddr > vecResolved;
+	ResolveHostname( entry.m_strHost.c_str(), &vecResolved );
+	for ( const SteamNetworkingIPAddr &ip : vecResolved )
 	{
-		CUtlVector< SteamNetworkingIPAddr > vecResolved;
-		ResolveHostname( entry.m_strHost.c_str(), &vecResolved );
-		for ( const SteamNetworkingIPAddr &ip : vecResolved )
-		{
-			netadr_t adr;
-			SteamNetworkingIPAddrToNetAdr( adr, ip );
-			entry.m_vecAddrs.push_back( adr );
-		}
+		netadr_t adr;
+		SteamNetworkingIPAddrToNetAdr( adr, ip );
+		entry.m_vecAddrs.push_back( adr );
 	}
 }
 
+// Entries are handed over one at a time, in configured order, so one slow lookup
+// doesn't hold back the servers before it.  A host listed more than once (the same
+// server on several ports) is looked up once; each entry keeps its own port.
 static void RunICEDNSResolveWorker( std::shared_ptr<ICEDNSResolveState> pState, std_vector< ICEServerEntry > vecEntries )
 {
-	ResolveServers( vecEntries );
+	struct LookedUpHost
+	{
+		std::string m_strHost; // without the port
+		std_vector< netadr_t > m_vecAddrs;
+	};
+	std_vector< LookedUpHost > vecLookedUp;
 
-	pState->m_vecEntries = std::move( vecEntries );
+	for ( ICEServerEntry &entry : vecEntries )
+	{
+		std::string strHost = entry.m_strHost;
+		uint16 nPort = 0;
+		const size_t nColon = strHost.find( ':' );
+		if ( nColon != std::string::npos )
+		{
+			nPort = (uint16)atoi( strHost.c_str() + nColon + 1 );
+			strHost.resize( nColon );
+		}
+
+		bool bCached = false;
+		for ( const LookedUpHost &prev : vecLookedUp )
+		{
+			if ( prev.m_strHost == strHost )
+			{
+				entry.m_vecAddrs = prev.m_vecAddrs;
+				for ( netadr_t &adr : entry.m_vecAddrs )
+					adr.SetPort( nPort );
+				bCached = true;
+				break;
+			}
+		}
+		if ( !bCached )
+		{
+			ResolveServerEntry( entry );
+			vecLookedUp.push_back( { strHost, entry.m_vecAddrs } );
+		}
+
+		std::lock_guard<std::mutex> lock( pState->m_mutex );
+		pState->m_vecResolved.push_back( std::move( entry ) );
+	}
 	pState->m_bDone = true;
 }
 
@@ -1420,12 +1457,19 @@ void CSteamNetworkingICESession::Think_ApplyPendingDNSResults()
 	if ( !m_pDNSResolveState )
 		return;
 
-	if ( !m_pDNSResolveState->m_bDone )
-		return;
-	std_vector< ICEServerEntry > vecEntries = std::move( m_pDNSResolveState->m_vecEntries );
-	m_pDNSResolveState.reset();
+	// Read the done flag before taking the entries: anything pushed after the swap is
+	// then still waiting for us, and the flag can only be set once the last push is in.
+	const bool bDone = m_pDNSResolveState->m_bDone;
+	std_vector< ICEServerEntry > vecEntries;
+	{
+		std::lock_guard<std::mutex> lock( m_pDNSResolveState->m_mutex );
+		vecEntries.swap( m_pDNSResolveState->m_vecResolved );
+	}
+	if ( bDone )
+		m_pDNSResolveState.reset();
 
-	AddServers( vecEntries );
+	if ( !vecEntries.empty() )
+		AddServers( vecEntries );
 }
 
 CSteamNetworkingICESession::CSteamNetworkingICESession( EICERole role, CSteamNetworkingICESessionCallbacks *pCallbacks, int nEncoding )
@@ -1452,8 +1496,10 @@ CSteamNetworkingICESession::CSteamNetworkingICESession( const ICESessionConfig& 
 
 	m_vecSTUNServers.reserve( cfg.m_nStunServers );
 
-	std_vector< ICEServerEntry > vecEntries;
-	bool bAllLiterals = true;
+	// Literal addresses are usable at once; hostnames go to a background lookup so
+	// DNS never blocks under the global lock.
+	std_vector< ICEServerEntry > vecLiteralEntries;
+	std_vector< ICEServerEntry > vecHostnameEntries;
 	auto AddEntry = [&]( bool bIsTURN, const char *pszHost, const char *pszUsername, const char *pszPassword )
 	{
 		ICEServerEntry entry;
@@ -1461,11 +1507,17 @@ CSteamNetworkingICESession::CSteamNetworkingICESession( const ICESessionConfig& 
 		entry.m_strHost = pszHost;
 		entry.m_strUsername = pszUsername;
 		entry.m_strPassword = pszPassword;
-		vecEntries.push_back( std::move( entry ) );
 
 		SteamNetworkingIPAddr addr;
-		if ( !addr.ParseString( pszHost ) )
-			bAllLiterals = false;
+		if ( addr.ParseString( pszHost ) )
+		{
+			ResolveServerEntry( entry );
+			vecLiteralEntries.push_back( std::move( entry ) );
+		}
+		else
+		{
+			vecHostnameEntries.push_back( std::move( entry ) );
+		}
 	};
 
 	for ( int i = 0; i < cfg.m_nStunServers; ++i )
@@ -1490,17 +1542,12 @@ CSteamNetworkingICESession::CSteamNetworkingICESession( const ICESessionConfig& 
 		AddEntry( true, pszHostname, pszUsername, pszPassword );
 	}
 
-	// Don't block on DNS under the global lock.  Any hostname sends the whole
-	// list to the background, to keep the configured (failover) order.
-	if ( bAllLiterals )
-	{
-		ResolveServers( vecEntries );
-		AddServers( vecEntries );
-	}
-	else
+	if ( !vecLiteralEntries.empty() )
+		AddServers( vecLiteralEntries );
+	if ( !vecHostnameEntries.empty() )
 	{
 		m_pDNSResolveState = std::make_shared<ICEDNSResolveState>();
-		AddICEDNSThread( std::thread( RunICEDNSResolveWorker, m_pDNSResolveState, std::move( vecEntries ) ), m_pDNSResolveState );
+		AddICEDNSThread( std::thread( RunICEDNSResolveWorker, m_pDNSResolveState, std::move( vecHostnameEntries ) ), m_pDNSResolveState );
 	}
 
 	m_nPermittedCandidateTypes = cfg.m_nCandidateTypes;
