@@ -645,6 +645,10 @@ namespace SteamNetworkingSocketsLib {
         // be mistaken for exhaustion.
         SteamNetworkingMicroseconds m_usecLastPeerCandidateActivity = 0;
 
+        // When StartSession ran.  The peer signals no "end of candidates", so a relay it is
+        // still allocating can only be waited for; see BAllCandidatesExhausted.
+        SteamNetworkingMicroseconds m_usecSessionStarted = 0;
+
         // Set once OnAllCandidatesFailed has fired for this session, so it only fires once.
         bool m_bAllCandidatesFailedNotified = false;
 

@@ -1776,7 +1776,8 @@ void CSteamNetworkingICESession::StartSession()
 {
     m_nextKeepalive = 0;
     m_pSelectedCandidatePair = nullptr;
-    m_usecLastPeerCandidateActivity = SteamNetworkingSockets_GetLocalTimestamp();
+    m_usecSessionStarted = SteamNetworkingSockets_GetLocalTimestamp();
+    m_usecLastPeerCandidateActivity = m_usecSessionStarted;
     m_bAllCandidatesFailedNotified = false;
     CCrypto::GenerateRandomBlock( &m_nRoleTiebreaker, sizeof( m_nRoleTiebreaker ) );
     SetNextThinkTimeASAP();
@@ -2473,9 +2474,29 @@ bool CSteamNetworkingICESession::BAllCandidatesExhausted( SteamNetworkingMicrose
     // Give a slow signaling round-trip (or the very first candidate) a grace period before
     // concluding nothing more is coming.  This also covers the "no pairs at all yet" case,
     // since m_usecLastPeerCandidateActivity starts at session start.
-    const SteamNetworkingMicroseconds k_usecAllCandidatesFailedGracePeriod = 2 * k_nMillion;
+    const SteamNetworkingMicroseconds k_usecAllCandidatesFailedGracePeriod = 3 * k_nMillion;
     if ( usecNow < m_usecLastPeerCandidateActivity + k_usecAllCandidatesFailedGracePeriod )
         return false;
+
+    // The peer never says it is done gathering, and its relay is the slowest candidate to
+    // arrive (a TURN allocation behind a DNS lookup and an auth round trip).  If relays are
+    // in play at all, a pair with the peer's relay could still work, so give it most of the
+    // connect timeout before concluding it isn't coming.
+    if ( ( m_nPermittedCandidateTypes & k_EICECandidate_Any_Relay ) && !m_vecTURNServers.empty() )
+    {
+        bool bHaveRemoteRelay = false;
+        for ( const ICEPeerCandidate &c : m_vecPeerCandidates )
+        {
+            if ( c.m_type == ICECandidateKind::Relayed )
+            {
+                bHaveRemoteRelay = true;
+                break;
+            }
+        }
+        const SteamNetworkingMicroseconds k_usecWaitForRemoteRelay = 8 * k_nMillion;
+        if ( !bHaveRemoteRelay && usecNow < m_usecSessionStarted + k_usecWaitForRemoteRelay )
+            return false;
+    }
 
     return true;
 }
