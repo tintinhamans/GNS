@@ -121,6 +121,11 @@ namespace SteamNetworkingSocketsLib {
         // the rest from ever being sent.
         SteamNetworkingMicroseconds m_usecNextAllocateDispatch = 0;
 
+        // Zero-lifetime Refresh requests releasing allocations we won't use (see
+        // ReleaseTURNAllocation).  Tracked only so they are freed with the interface; a
+        // reply or the retry schedule ends them on their own.
+        std_vector< CSteamNetworkingSocketsSTUNRequest* > m_vecPendingReleaseRequests;
+
         // Server-reflexive discovery results.  m_addrSTUNServer is also used
         // as a "discovery complete" signal: it is all-zeros until a terminal
         // result (success, no-NAT, or timeout) has been recorded.
@@ -705,6 +710,7 @@ namespace SteamNetworkingSocketsLib {
         void STUNRequestCallback_ServerReflexiveKeepAlive( const RecvSTUNPktInfo_t &info );
         void STUNRequestCallback_AllocateRelay( const RecvSTUNPktInfo_t &info );
         void STUNRequestCallback_RefreshAllocation( const RecvSTUNPktInfo_t &info );
+        void STUNRequestCallback_ReleaseAllocation( const RecvSTUNPktInfo_t &info );
         void STUNRequestCallback_CreatePermission( const RecvSTUNPktInfo_t &info );
         void STUNRequestCallback_PeerConnectivityCheck( const RecvSTUNPktInfo_t &info );
 

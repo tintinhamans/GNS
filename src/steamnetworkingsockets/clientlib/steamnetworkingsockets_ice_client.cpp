@@ -1213,11 +1213,10 @@ void ICESessionInterface::ReleaseTURNAllocation( const netadr_t &addrTURNServer,
         nEncoding |= kSTUNPacketEncodingFlags_MessageIntegrity;
     }
 
-    // Fire and forget: not tracked in any pending-request list, so its response (if any)
-    // won't be matched and it will just retry a few times and self-destruct.  That's fine --
-    // we don't need confirmation, and the packets we do send are enough to release the
-    // allocation server-side.
-    pRequest->Queue( k_nTURN_RefreshRequest, nEncoding, addrTURNServer, nullptr, attrs, nAttrs );
+    // Nothing to do with the outcome, but the request must not outlive this interface:
+    // its retry schedule runs on the service thread and sends through us.
+    m_vecPendingReleaseRequests.push_back( pRequest );
+    pRequest->Queue( k_nTURN_RefreshRequest, nEncoding, addrTURNServer, &CSteamNetworkingICESession::STUNRequestCallback_ReleaseAllocation, attrs, nAttrs );
 }
 
 void ICESessionInterface::QueueRefreshRequest( RecvSTUNPacketCallback_t cb, int nEncoding, int nAuthRetriesUsed )
@@ -1530,6 +1529,9 @@ CSteamNetworkingICESession::~CSteamNetworkingICESession()
         for ( CSteamNetworkingSocketsSTUNRequest *p : pIntf->m_vecPendingAllocateRequests )
             delete p;
         pIntf->m_vecPendingAllocateRequests.clear();
+        for ( CSteamNetworkingSocketsSTUNRequest *p : pIntf->m_vecPendingReleaseRequests )
+            delete p;
+        pIntf->m_vecPendingReleaseRequests.clear();
     }
 
     for ( ICECandidatePair *pPair: m_vecCandidatePairs )
@@ -1882,6 +1884,9 @@ void CSteamNetworkingICESession::GatherInterfaces()
             for ( CSteamNetworkingSocketsSTUNRequest *p : intf->m_vecPendingAllocateRequests )
                 delete p;
             intf->m_vecPendingAllocateRequests.clear();
+            for ( CSteamNetworkingSocketsSTUNRequest *p : intf->m_vecPendingReleaseRequests )
+                delete p;
+            intf->m_vecPendingReleaseRequests.clear();
 
             erase_at( m_vecInterfaces, i );
             continue;
@@ -2068,6 +2073,8 @@ not_stun:
             pRequest = FindPendingRequestByTransactionID( pInterface->m_vecPendingSrflxRequests, header );
             if ( pRequest == nullptr )
                 pRequest = FindPendingRequestByTransactionID( pInterface->m_vecPendingAllocateRequests, header );
+            if ( pRequest == nullptr )
+                pRequest = FindPendingRequestByTransactionID( pInterface->m_vecPendingReleaseRequests, header );
             if ( pRequest == nullptr )
             {
                 for ( CSteamNetworkingSocketsSTUNRequest *p : m_vecPendingPeerRequests )
@@ -2870,6 +2877,12 @@ void CSteamNetworkingICESession::Think_TURNMaintenance( SteamNetworkingMicroseco
                 peerAttrs, nPeerAttrs );
         }
     }
+}
+
+void CSteamNetworkingICESession::STUNRequestCallback_ReleaseAllocation( const RecvSTUNPktInfo_t &info )
+{
+    // Whatever the outcome, there is nothing left to do for a released allocation.
+    find_and_remove_element( info.m_pRequest->m_pInterface->m_vecPendingReleaseRequests, info.m_pRequest );
 }
 
 void CSteamNetworkingICESession::STUNRequestCallback_CreatePermission( const RecvSTUNPktInfo_t &info )
