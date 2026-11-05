@@ -160,6 +160,11 @@ namespace SteamNetworkingSocketsLib {
         // new CreatePermission sweep is needed.
         int m_nTURNPermissionRevision = 0;
 
+        // When to re-send CreatePermission for the same IPs.  RFC 5766 sec 8: a permission
+        // lapses after 300 s unless refreshed, and the relay then drops the peer's packets.
+        // Zero means no permission granted yet.
+        SteamNetworkingMicroseconds m_usecPermissionRefreshAfter = 0;
+
         /// Send a packet through this interface to the destination remote address.
         /// If relay address is non-zero, send via Send Indication to the TURN server
         bool SendPacketGather( int nChunks, const iovec *pChunks, int cbPayload, const netadr_t &addrPeer, const netadr_t &addrRelay );

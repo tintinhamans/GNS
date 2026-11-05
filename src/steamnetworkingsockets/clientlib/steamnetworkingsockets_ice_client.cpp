@@ -2805,6 +2805,7 @@ void CSteamNetworkingICESession::FailOverRelay( ICESessionInterface *pIntf )
     pIntf->m_addrTURNServer.Clear();   // clears "discovery done" signal; re-allocation starts next tick
     pIntf->m_usecRefreshAfter  = 0;
     pIntf->m_nTURNPermissionRevision = 0;
+    pIntf->m_usecPermissionRefreshAfter = 0;
     pIntf->m_strTURNRealm.clear();     // stale credentials for the lost server; discovery
     pIntf->m_strTURNNonce.clear();     // re-authenticates from scratch with whichever
     V_memset( pIntf->m_arrTURNKey, 0, sizeof( pIntf->m_arrTURNKey ) ); // server wins next
@@ -2836,7 +2837,8 @@ void CSteamNetworkingICESession::Think_TURNMaintenance( SteamNetworkingMicroseco
         const std_vector<CIPAddress> &vecPermitted = bIsIPv4 ? m_vecTURNPermittedIPv4 : m_vecTURNPermittedIPv6;
         int nSessionRevision = bIsIPv4 ? m_nTURNPermissionRevisionIPv4 : m_nTURNPermissionRevisionIPv6;
 
-        if ( pIntf->m_nTURNPermissionRevision >= nSessionRevision || vecPermitted.empty() )
+        const bool bPermissionsLapsing = pIntf->m_usecPermissionRefreshAfter != 0 && usecNow >= pIntf->m_usecPermissionRefreshAfter;
+        if ( ( pIntf->m_nTURNPermissionRevision >= nSessionRevision && !bPermissionsLapsing ) || vecPermitted.empty() )
             continue;
 
         // Build one XOR-PEER-ADDRESS attribute per permitted IP.
@@ -2977,6 +2979,10 @@ void CSteamNetworkingICESession::STUNRequestCallback_CreatePermission( const Rec
     // If more IPs arrived while the request was in flight, the revision will still be
     // behind the session's current revision, and we'll send another CreatePermission.
     pIntf->m_nTURNPermissionRevision = info.m_pRequest->m_nTURNPermissionRevision;
+
+    // Refresh a minute ahead of the 300 s expiry.  A lost refresh leaves this in the past,
+    // so Think_TURNMaintenance keeps retrying until one is answered.
+    pIntf->m_usecPermissionRefreshAfter = info.m_usecNow + 240 * k_nMillion;
 }
 
 void CSteamNetworkingICESession::STUNRequestCallback_ServerReflexiveCandidate( const RecvSTUNPktInfo_t &info )
