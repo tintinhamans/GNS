@@ -58,7 +58,7 @@ namespace SteamNetworkingSocketsLib {
     EICECandidateType CalcICECandidateType( ICECandidateKind kind, const netadr_t& addr );
 
     /// Represents one local network interface used for ICE candidate gathering.
-    /// Owns its socket and tracks at most one in-flight server-reflexive STUN request.
+    /// Owns its socket. Srflx and relay discovery each race every server of this interface's family.
     struct ICESessionInterface
     {
         // The session that owns this interface.
@@ -85,23 +85,34 @@ namespace SteamNetworkingSocketsLib {
         // to keep all internal address handling in one type.
         netadr_t m_boundAddr;
 
-        // In-flight STUN bind request for server-reflexive discovery or
-        // keepalive, or null if none is active.  At most one per interface.
+        // Keepalive, or TURN refresh and CreatePermission on the won relay, one at a time unlike discovery.
         CSteamNetworkingSocketsSTUNRequest *m_pPendingSTUNRequest = nullptr;
+
+        // One srflx discovery request per STUN server of this family, the first reply wins.
+        std_vector< CSteamNetworkingSocketsSTUNRequest* > m_vecPendingSrflxRequests;
+
+        // Number of m_vecSTUNServers entries already dispatched, so servers resolved later still join the race.
+        int m_nSTUNServersDispatched = 0;
+
+        // One Allocate per TURN server of this family, the first success wins and late ones are released.
+        std_vector< CSteamNetworkingSocketsSTUNRequest* > m_vecPendingAllocateRequests;
+
+        // Number of m_vecTURNServers entries already dispatched, see m_nSTUNServersDispatched.
+        int m_nTURNServersDispatched = 0;
 
         // Server-reflexive discovery results.  m_addrSTUNServer is also used
         // as a "discovery complete" signal: it is all-zeros until a terminal
         // result (success, no-NAT, or timeout) has been recorded.
         netadr_t m_addrServerReflexive;  // invalid = not found / no-NAT
         netadr_t m_addrSTUNServer;       // server that gave us the result
-        bool m_bServerReflexiveFailed = false;             // true if all STUN servers timed out
+        bool m_bServerReflexiveFailed = false;             // true if every dispatched STUN server timed out
 
         // Relay (TURN) discovery results.  m_addrTURNServer is also used
         // as a "discovery complete" signal: it is all-zeros until a terminal
         // result (success or timeout) has been recorded.
         netadr_t m_addrRelayed;     // invalid = no relay / not yet allocated
         netadr_t m_addrTURNServer;  // TURN server that gave us the relay
-        bool m_bRelayFailed = false;                  // true if all TURN servers timed out/failed
+        bool m_bRelayFailed = false;                  // true if every dispatched TURN server timed out/failed
 
         // TURN long-term credentials (RFC 5766 section 10).  Populated on receipt of a
         // 401 challenge from the TURN server.  m_strTURNRealm is empty until then.
@@ -128,20 +139,28 @@ namespace SteamNetworkingSocketsLib {
         // EICECandidateType, then calls m_session's OnLocalCandidateDiscovered callback.
         void NotifyLocalCandidateDiscovered( ICECandidateKind kind, const netadr_t& addr );
 
-        // Send a STUN binding/keepalive request
+        // Tracked in m_vecPendingSrflxRequests, so many servers can race at once.
+        void QueueSrflxDiscoveryRequest( const netadr_t &addrSTUNServer, int nServerIdx, RecvSTUNPacketCallback_t cb, int nEncoding );
+
+        // Keepalive binding request, one in flight per interface.
         void QueueBindRequest( const netadr_t &addrSTUNServer, RecvSTUNPacketCallback_t cb, int nEncoding );
 
-        // Send a TURN Allocate request
-        void QueueAllocateRequest( int nTURNServerIdx, RecvSTUNPacketCallback_t cb, int nEncoding );
+        // Send (or re-send after a 401 challenge) a TURN Allocate request for concurrent
+        // relay discovery, tracked in m_vecPendingAllocateRequests.  pRealm/pNonce/pKey carry
+        // long-term-credential state for this specific server if a prior challenge already
+        // primed them; null for a first attempt.
+        void QueueAllocateDiscoveryRequest( int nTURNServerIdx, const std::string *pRealm, const std::string *pNonce, const uint8 *pKey );
 
-        // Send a TURN Refresh request to keep the allocation alive
         void QueueRefreshRequest( RecvSTUNPacketCallback_t cb, int nEncoding );
+
+        // Releases an allocation that a losing racer still won, with LIFETIME=0. The reply is not tracked.
+        void ReleaseTURNAllocation( const netadr_t &addrTURNServer, int nTURNServerIdx, const std::string &strRealm, const std::string &strNonce, const uint8 arrKey[16] );
 
         // Create and queue any TURN request, attaching long-term auth credentials when
         // we have them.  pExtraAttrs/nExtraAttrs are request-specific attrs (e.g.
         // REQUESTED-TRANSPORT for Allocate); auth attrs are appended after them.
-        // Returns false and cleans up m_pPendingSTUNRequest if credential lookup fails.
-        bool QueueTURNRequest( uint32 nMsgType, int nEncoding, const netadr_t &addrTURNServer, RecvSTUNPacketCallback_t cb, STUNAttribute *pExtraAttrs, int nExtraAttrs );
+        // Returns false and cleans up pRequestSlot if credential lookup fails.
+        bool QueueTURNRequest( uint32 nMsgType, int nEncoding, const netadr_t &addrTURNServer, RecvSTUNPacketCallback_t cb, STUNAttribute *pExtraAttrs, int nExtraAttrs, CSteamNetworkingSocketsSTUNRequest *&pRequestSlot );
 
         ICESessionInterface( CSteamNetworkingICESession &session, uint32 nPriority, int nPrefixLen )
             : m_session( session ), m_nPriority( nPriority ), m_nPrefixLen( nPrefixLen ), m_pSocket( nullptr ) {}
@@ -255,6 +274,14 @@ namespace SteamNetworkingSocketsLib {
         // For STUN binding and TURN Allocate requests, the index of the server in the
         // session's STUN or TURN server list.  Used to fail over to the next entry.
         int m_nServerIdx = 0;
+
+        // For TURN Allocate discovery requests only: the long-term-credential state this
+        // specific request used (if any), captured from that server's 401 challenge.
+        // Carried onto the winning interface's persistent fields on success so
+        // Think_TURNMaintenance can keep authenticating to the same server afterward.
+        std::string m_strTURNRealm;
+        std::string m_strTURNNonce;
+        uint8 m_arrTURNKey[16] = {};
 
         // Serialize the packet and start the retry loop.
         void Queue( uint32 nMessageType, int nEncoding, netadr_t remoteAddr, RecvSTUNPacketCallback_t cb, STUNAttribute *pExtraAttrs = nullptr, int nExtraAttrs = 0 );
