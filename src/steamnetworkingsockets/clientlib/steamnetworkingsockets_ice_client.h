@@ -546,6 +546,16 @@ namespace SteamNetworkingSocketsLib {
         // each Think() pass before the regular check list.
         std_vector< ICECandidatePair* > m_vecTriggeredCheckQueue;
 
+        // Session start or the latest peer candidate change. Exhaustion waits a grace period past this,
+        // so a slow signaling round trip is not mistaken for it.
+        SteamNetworkingMicroseconds m_usecLastPeerCandidateActivity = 0;
+
+        // When StartSession ran. The peer signals no end of candidates, so a relay it is still allocating
+        // can only be waited for, see BAllCandidatesExhausted.
+        SteamNetworkingMicroseconds m_usecSessionStarted = 0;
+
+        bool m_bAllCandidatesFailedNotified = false;
+
         void GatherInterfaces();
         void UpdateKeepalive( ICESessionInterface *pIntf );
 
@@ -557,6 +567,11 @@ namespace SteamNetworkingSocketsLib {
         // Drops this interface's relay and its pairs, then races the TURN servers again. Other pairs stay.
         void FailOverRelay( ICESessionInterface *pIntf );
         void Think_TestPeerConnectivity();
+
+        // Returns true once every interface finished gathering, no DNS is pending and every pair failed, with
+        // no peer candidate activity for the grace period. Never true while a working pair is still possible.
+        bool BAllCandidatesExhausted( SteamNetworkingMicroseconds usecNow ) const;
+        void Think_CheckAllCandidatesFailed( SteamNetworkingMicroseconds usecNow );
 
         void SetSelectedCandidatePair( ICECandidatePair *pPair );
 
@@ -585,6 +600,10 @@ namespace SteamNetworkingSocketsLib {
         virtual void OnLocalCandidateDiscovered( EICECandidateType type, const char *pszCandidateStr ) {}
         virtual void OnPacketReceived( const RecvPktInfo_t &info ) {}
         virtual void OnConnectionSelected( const ICELocalCandidate& localCandidate, const CSteamNetworkingICESession::ICECandidateBase& remoteCandidate ) {}
+
+        // Called at most once per session, when every pair failed after gathering finished.
+        // The caller ends the connection instead of waiting out the connect timeout.
+        virtual void OnAllCandidatesFailed() {}
     };
 
 
@@ -612,6 +631,7 @@ namespace SteamNetworkingSocketsLib {
         virtual void OnLocalCandidateDiscovered( EICECandidateType type, const char *pszCandidateStr ) override;
         virtual void OnPacketReceived( const RecvPktInfo_t &info ) override;
         virtual void OnConnectionSelected( const ICELocalCandidate& localCandidate, const CSteamNetworkingICESession::ICECandidateBase& remoteCandidate ) override;
+        virtual void OnAllCandidatesFailed() override;
     };
 
 } // namespace SteamNetworkingSocketsLib
