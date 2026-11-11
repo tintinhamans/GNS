@@ -5,16 +5,21 @@
 #include <mutex>
 #include <string.h>
 
+#include <atomic>
+#include <memory>
 #include <string>
+#include <thread>
 
 #include <absl/types/optional.h>
 #include <absl/memory/memory.h>
 #include <api/async_resolver_factory.h>
 #include <api/turn_customizer.h>
 #include <rtc_base/network_route.h>
+#include <rtc_base/async_resolver_interface.h>
 #include <rtc_base/bind.h>
 #include <rtc_base/physical_socket_server.h>
 #include <rtc_base/ssl_adapter.h>
+#include <rtc_base/task_utils/to_queued_task.h>
 
 #include <api/jsep.h>
 #include <p2p/base/p2p_transport_channel.h>
@@ -54,6 +59,138 @@ extern "C"
 {
 STEAMWEBRTC_DECLSPEC IICESession *CreateWebRTCICESession( const ICESessionConfig &cfg, IICESessionDelegate *pDelegate, int nInterfaceVersion );
 }
+
+namespace rtc
+{
+	// Not declared in any header at the pinned WebRTC revision.
+	int ResolveHostname( const std::string &hostname, int family, std::vector<IPAddress> *addresses );
+}
+
+namespace {
+
+// Shared by the resolver, its worker and the posted result, so it outlives the resolver.
+struct AsyncResolverState
+{
+	std::mutex mutex;
+	bool alive = true; // Guarded by mutex
+	std::atomic<bool> finished{ false }; // Only set while holding mutex
+};
+
+// Unlike rtc::AsyncResolver, the worker thread exits as soon as the lookup is done.
+class CAsyncResolver final : public rtc::AsyncResolverInterface
+{
+public:
+	void Start( const rtc::SocketAddress &addr ) override
+	{
+		addr_ = addr;
+
+		rtc::Thread *pCallingThread = rtc::Thread::Current();
+		Assert( pCallingThread != nullptr );
+
+		worker_ = std::thread( [this, state = state_, pCallingThread, hostname = addr.hostname(), family = addr.family()]()
+		{
+			std::vector<rtc::IPAddress> addresses;
+			int error = rtc::ResolveHostname( hostname, family, &addresses );
+
+			// Must not touch the calling thread once Destroy() has run.
+			std::lock_guard<std::mutex> lock( state->mutex );
+			state->finished = true;
+			if ( !state->alive )
+				return;
+			pCallingThread->PostTask( webrtc::ToQueuedTask(
+				[this, state, addresses = std::move( addresses ), error]() mutable
+				{
+					{
+						std::lock_guard<std::mutex> lock( state->mutex );
+						if ( !state->alive )
+							return;
+					}
+					ResolveDone( std::move( addresses ), error );
+				} ) );
+		} );
+	}
+
+	bool GetResolvedAddress( int family, rtc::SocketAddress *addr ) const override
+	{
+		if ( error_ != 0 || addresses_.empty() )
+			return false;
+
+		*addr = addr_;
+		for ( const rtc::IPAddress &ip : addresses_ )
+		{
+			if ( family == ip.family() )
+			{
+				addr->SetResolvedIP( ip );
+				return true;
+			}
+		}
+		return false;
+	}
+
+	int GetError() const override { return error_; }
+
+	void Destroy( bool wait ) override
+	{
+		// Must run on the thread that called Start(), like the posted result.
+		{
+			std::lock_guard<std::mutex> lock( state_->mutex );
+			state_->alive = false;
+		}
+
+		if ( worker_.joinable() )
+		{
+			// Joining a finished worker does not block. A worker still inside the lookup cannot be cancelled,
+			// it touches only its shared state and finishes on its own.
+			if ( wait || state_->finished )
+				worker_.join();
+			else
+				worker_.detach();
+		}
+
+		// Called from a SignalDone handler, ResolveDone() deletes this resolver after the signal.
+		if ( in_signal_ )
+		{
+			destroy_pending_ = true;
+			return;
+		}
+		delete this;
+	}
+
+private:
+	~CAsyncResolver() override = default;
+
+	void ResolveDone( std::vector<rtc::IPAddress> addresses, int error )
+	{
+		addresses_ = std::move( addresses );
+		error_ = error;
+		in_signal_ = true;
+		SignalDone( this );
+		in_signal_ = false;
+		if ( destroy_pending_ )
+			delete this;
+	}
+
+	rtc::SocketAddress addr_;
+	std::vector<rtc::IPAddress> addresses_;
+	int error_ = -1;
+	bool in_signal_ = false;
+	bool destroy_pending_ = false;
+	std::thread worker_;
+	std::shared_ptr<AsyncResolverState> state_ = std::make_shared<AsyncResolverState>();
+};
+
+class CPacketSocketFactory final : public rtc::BasicPacketSocketFactory
+{
+public:
+	explicit CPacketSocketFactory( rtc::Thread *thread ) : rtc::BasicPacketSocketFactory( thread ) {}
+
+	rtc::AsyncResolverInterface *CreateAsyncResolver() override
+	{
+		return new CAsyncResolver();
+	}
+};
+
+} // namespace <anonymous>
 
 //-----------------------------------------------------------------------------
 // Class to represent an ICE connection
@@ -240,7 +377,7 @@ bool CICESession::BInitializeOnSocketThread( const ICESessionConfig &cfg )
 
 	default_network_manager_.reset(new rtc::BasicNetworkManager());
 	default_socket_factory_.reset(
-		new rtc::BasicPacketSocketFactory( s_pSocketThread ));
+		new CPacketSocketFactory( s_pSocketThread ));
 
 	webrtc::TurnCustomizer *turn_customizer = nullptr;
 
