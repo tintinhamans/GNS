@@ -100,6 +100,15 @@ namespace SteamNetworkingSocketsLib {
         // Number of m_vecTURNServers entries already dispatched, see m_nSTUNServersDispatched.
         int m_nTURNServersDispatched = 0;
 
+        // Every Allocate creates server state, so servers are tried a stagger apart instead of all at once.
+        SteamNetworkingMicroseconds m_usecNextAllocateDispatch = 0;
+
+        // Zero-lifetime Refreshes releasing unused allocations, tracked only to free them with the interface.
+        std_vector< CSteamNetworkingSocketsSTUNRequest* > m_vecPendingReleaseRequests;
+
+        // CreatePermission auth rejections in a row, past the cap the relay fails over.
+        int m_nCreatePermissionAuthRetries = 0;
+
         // Server-reflexive discovery results.  m_addrSTUNServer is also used
         // as a "discovery complete" signal: it is all-zeros until a terminal
         // result (success, no-NAT, or timeout) has been recorded.
@@ -145,13 +154,11 @@ namespace SteamNetworkingSocketsLib {
         // Keepalive binding request, one in flight per interface.
         void QueueBindRequest( const netadr_t &addrSTUNServer, RecvSTUNPacketCallback_t cb, int nEncoding );
 
-        // Send (or re-send after a 401 challenge) a TURN Allocate request for concurrent
-        // relay discovery, tracked in m_vecPendingAllocateRequests.  pRealm/pNonce/pKey carry
-        // long-term-credential state for this specific server if a prior challenge already
-        // primed them; null for a first attempt.
-        void QueueAllocateDiscoveryRequest( int nTURNServerIdx, const std::string *pRealm, const std::string *pNonce, const uint8 *pKey );
+        // pRealm, pNonce and pKey carry this server's credentials after a challenge and are null on a first try.
+        // nAuthRetriesUsed bounds the retry loop against a misbehaving server.
+        void QueueAllocateDiscoveryRequest( int nTURNServerIdx, const std::string *pRealm, const std::string *pNonce, const uint8 *pKey, int nAuthRetriesUsed = 0, bool bForceIPv4Relay = false );
 
-        void QueueRefreshRequest( RecvSTUNPacketCallback_t cb, int nEncoding );
+        void QueueRefreshRequest( RecvSTUNPacketCallback_t cb, int nEncoding, int nAuthRetriesUsed = 0 );
 
         // Releases an allocation that a losing racer still won, with LIFETIME=0. The reply is not tracked.
         void ReleaseTURNAllocation( const netadr_t &addrTURNServer, int nTURNServerIdx, const std::string &strRealm, const std::string &strNonce, const uint8 arrKey[16] );
@@ -179,6 +186,13 @@ namespace SteamNetworkingSocketsLib {
         ICESessionInterface *m_pInterface;
         netadr_t m_addrTURNServer;  // invalid = host candidate
         bool IsRelay() const { return m_addrTURNServer.IsValid(); }
+
+        // Returns the family this candidate uses, for a relay the allocated address, which can differ from
+        // the interface's. RFC 8445 pairs only within one family.
+        ipadrtype_t GetAddressType() const
+        {
+            return IsRelay() ? m_pInterface->m_addrRelayed.GetType() : m_pInterface->m_boundAddr.GetType();
+        }
     };
 
     // Parsed representation of an RFC 5245 candidate-attribute line.
@@ -232,9 +246,15 @@ namespace SteamNetworkingSocketsLib {
     const uint32 k_nTURN_Attr_Lifetime           = 0x000D;
     const uint32 k_nTURN_Attr_XORPeerAddress     = 0x0012;
     const uint32 k_nTURN_Attr_Data               = 0x0013;
+    const uint32 k_nTURN_Attr_RequestedAddressFamily = 0x0017; // RFC 8656 sec 18.5
     const uint32 k_nTURN_Attr_XORRelayedAddress  = 0x0016;
     const uint32 k_nTURN_Attr_RequestedTransport = 0x0019;
 
+    // STUN and TURN error codes handled here, RFC 5389 sec 15.6, RFC 5766 sec 10, RFC 8656 sec 18.6.
+    const int k_nTURNErrorCode_Unauthorized          = 401; // missing or wrong long-term credentials
+    const int k_nTURNErrorCode_StaleNonce            = 438; // credentials were fine, but the nonce expired
+    const int k_nTURNErrorCode_UnknownAttribute      = 420; // server does not understand REQUESTED-ADDRESS-FAMILY
+    const int k_nTURNErrorCode_AddressFamilyNotSupported = 440; // server understands it, but does not allocate IPv6 here
 
     enum STUNPacketEncodingFlags
     {
@@ -275,13 +295,17 @@ namespace SteamNetworkingSocketsLib {
         // session's STUN or TURN server list.  Used to fail over to the next entry.
         int m_nServerIdx = 0;
 
-        // For TURN Allocate discovery requests only: the long-term-credential state this
-        // specific request used (if any), captured from that server's 401 challenge.
-        // Carried onto the winning interface's persistent fields on success so
-        // Think_TURNMaintenance can keep authenticating to the same server afterward.
+        // Allocate only. Credentials from this server's 401 or 438 challenge, carried to the winning
+        // interface so Think_TURNMaintenance keeps authenticating to the same server.
         std::string m_strTURNRealm;
         std::string m_strTURNNonce;
         uint8 m_arrTURNKey[16] = {};
+
+        // Auth challenge retries after a 401 or 438, carried into each retry and capped against loops.
+        int m_nAuthRetriesUsed = 0;
+
+        // Allocate only. Set when the request asked for an IPv6 relay, so a 420 or 440 reply retries once without it.
+        bool m_bRequestedIPv6Relay = false;
 
         // Serialize the packet and start the retry loop.
         void Queue( uint32 nMessageType, int nEncoding, netadr_t remoteAddr, RecvSTUNPacketCallback_t cb, STUNAttribute *pExtraAttrs = nullptr, int nExtraAttrs = 0 );
@@ -527,8 +551,11 @@ namespace SteamNetworkingSocketsLib {
 
         void Think_KeepAliveOnCandidates( SteamNetworkingMicroseconds usecNow );
         void Think_DiscoverServerReflexiveCandidates();
-        void Think_DiscoverRelayCandidate();
+        void Think_DiscoverRelayCandidate( SteamNetworkingMicroseconds usecNow );
         void Think_TURNMaintenance( SteamNetworkingMicroseconds usecNow );
+
+        // Drops this interface's relay and its pairs, then races the TURN servers again. Other pairs stay.
+        void FailOverRelay( ICESessionInterface *pIntf );
         void Think_TestPeerConnectivity();
 
         void SetSelectedCandidatePair( ICECandidatePair *pPair );
@@ -544,6 +571,7 @@ namespace SteamNetworkingSocketsLib {
         void STUNRequestCallback_ServerReflexiveKeepAlive( const RecvSTUNPktInfo_t &info );
         void STUNRequestCallback_AllocateRelay( const RecvSTUNPktInfo_t &info );
         void STUNRequestCallback_RefreshAllocation( const RecvSTUNPktInfo_t &info );
+        void STUNRequestCallback_ReleaseAllocation( const RecvSTUNPktInfo_t &info );
         void STUNRequestCallback_CreatePermission( const RecvSTUNPktInfo_t &info );
         void STUNRequestCallback_PeerConnectivityCheck( const RecvSTUNPktInfo_t &info );
 
