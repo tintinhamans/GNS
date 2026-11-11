@@ -12,6 +12,7 @@
 #include "crypto.h"
 #include "steamnetworkingsockets_mock.h"
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -1472,6 +1473,8 @@ CSteamNetworkingICESession::CSteamNetworkingICESession( EICERole role, CSteamNet
     m_pSelectedCandidatePair = nullptr;
     m_vecInterfaces.reserve( 16 );
 	m_nPermittedCandidateTypes = k_EICECandidate_Any;
+	m_nLastSeenNetworkChangeGeneration = GetNetworkChangeGeneration();
+	m_nLastAppliedNetworkChangeGeneration = m_nLastSeenNetworkChangeGeneration;
 }
 
 CSteamNetworkingICESession::CSteamNetworkingICESession( const ICESessionConfig& cfg, CSteamNetworkingICESessionCallbacks *pCallbacks )
@@ -1538,6 +1541,10 @@ CSteamNetworkingICESession::CSteamNetworkingICESession( const ICESessionConfig& 
 		m_pDNSResolveState = std::make_shared<ICEDNSResolveState>();
 		AddICEDNSThread( std::thread( RunICEDNSResolveWorker, m_pDNSResolveState, std::move( vecHostnameEntries ) ), m_pDNSResolveState );
 	}
+
+	// Start from the current count, so an earlier change in the process does not look new.
+	m_nLastSeenNetworkChangeGeneration = GetNetworkChangeGeneration();
+	m_nLastAppliedNetworkChangeGeneration = m_nLastSeenNetworkChangeGeneration;
 
 	m_nPermittedCandidateTypes = cfg.m_nCandidateTypes;
 	m_strLocalUsernameFragment = cfg.m_pszLocalUserFrag;
@@ -1780,7 +1787,8 @@ void CSteamNetworkingICESession::GatherInterfaces()
 	SteamNetworkingGlobalLock::AssertHeldByCurrentThread( "CSteamNetworkingICESession::GatherInterfaces" );
 
     CUtlVector<LocalAddress_t> vecAddrs;
-    if ( !GetLocalAddresses( &vecAddrs ) )
+    CUtlVector<SteamNetworkingIPAddr> vecAllAssignedAddrs;
+    if ( !GetLocalAddresses( &vecAddrs, &vecAllAssignedAddrs ) )
         return;
 
     m_bInterfaceListStale = false;
@@ -1810,6 +1818,44 @@ void CSteamNetworkingICESession::GatherInterfaces()
 
         if ( !bFound )
         {
+            // A deprecated IPv6 privacy address can lose the one-per-adapter pick and still work.
+            // An interface that is still assigned and backs a selected or succeeded pair stays.
+            bool bStillAssigned = false;
+            for ( const SteamNetworkingIPAddr &addr : vecAllAssignedAddrs )
+            {
+                netadr_t addrCheck;
+                SteamNetworkingIPAddrToNetAdr( addrCheck, addr );
+                if ( addrCheck.GetIP() == intf->m_boundAddr.GetIP() )
+                {
+                    bStillAssigned = true;
+                    break;
+                }
+            }
+
+            if ( bStillAssigned )
+            {
+                bool bBacksImportantPair =
+                    m_pSelectedCandidatePair != nullptr && m_pSelectedCandidatePair->m_localCandidate.m_pInterface == intf;
+                if ( !bBacksImportantPair )
+                {
+                    for ( ICECandidatePair *pPair : m_vecCandidatePairs )
+                    {
+                        if ( pPair->m_localCandidate.m_pInterface == intf && pPair->m_nState == kICECandidatePairState_Succeeded )
+                        {
+                            bBacksImportantPair = true;
+                            break;
+                        }
+                    }
+                }
+
+                if ( bBacksImportantPair )
+                {
+                    if ( intf->m_nPriority <= uNextPriority )
+                        uNextPriority = intf->m_nPriority-1;
+                    continue;
+                }
+            }
+
             // ICESessionInterface disappeared!  Delete the socket and all candidates
             // and pairs that use it
             SpewMsg( "ICE: Local interface %s removed\n", CUtlNetAdrRender( intf->m_boundAddr ).String() );
@@ -1846,6 +1892,15 @@ void CSteamNetworkingICESession::GatherInterfaces()
         if ( intf->m_nPriority <= uNextPriority )
             uNextPriority = intf->m_nPriority-1;
     }
+
+    // Default-route adapter first, then Ethernet, Wi-Fi, other physical and virtual adapters, which are never dropped.
+    // Without metadata, as on POSIX, everything compares equal and stable_sort keeps the OS order.
+    std::stable_sort( vecAddrs.begin(), vecAddrs.end(), []( const LocalAddress_t &a, const LocalAddress_t &b )
+    {
+        if ( a.m_bDefaultRoute != b.m_bDefaultRoute )
+            return a.m_bDefaultRoute;
+        return a.m_nAdapterKind > b.m_nAdapterKind;
+    } );
 
     // Second pass: add genuinely new interfaces.  Assign priorities counting
     // down from just below the lowest surviving priority (or from 65535 if
@@ -2260,6 +2315,22 @@ void CSteamNetworkingICESession::Think( SteamNetworkingMicroseconds usecNow )
     SetNextThinkTime( usecNow + SteamNetworkingMicroseconds( 50000 ) ); // 50ms think rate
 
     Think_ApplyPendingDNSResults();
+
+    // Polls the OS network change counter every tick and debounces it,
+    // so a burst of notifications during a VPN connect regathers once.
+    const SteamNetworkingMicroseconds k_usecNetworkChangeDebounce = 1 * k_nMillion;
+    const uint32 nNetworkChangeGeneration = GetNetworkChangeGeneration();
+    if ( nNetworkChangeGeneration != m_nLastSeenNetworkChangeGeneration )
+    {
+        m_nLastSeenNetworkChangeGeneration = nNetworkChangeGeneration;
+        m_usecNetworkChangeGenerationChangedAt = usecNow;
+    }
+    else if ( nNetworkChangeGeneration != m_nLastAppliedNetworkChangeGeneration
+        && usecNow - m_usecNetworkChangeGenerationChangedAt >= k_usecNetworkChangeDebounce )
+    {
+        m_nLastAppliedNetworkChangeGeneration = nNetworkChangeGeneration;
+        InvalidateInterfaceList();
+    }
 
     if ( m_bInterfaceListStale )
     {

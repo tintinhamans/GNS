@@ -434,6 +434,12 @@ namespace SteamNetworkingSocketsLib {
         // will re-enumerate interfaces and rebuild candidates, then clear this flag.
         bool m_bInterfaceListStale;
 
+        // Debounced GetNetworkChangeGeneration() tracking, so a burst of OS change notifications during
+        // a VPN connect triggers one regather once the counter stops moving.
+        uint32 m_nLastSeenNetworkChangeGeneration = 0;    // Most recent value observed, even if not yet acted on
+        uint32 m_nLastAppliedNetworkChangeGeneration = 0; // Value InvalidateInterfaceList() last ran for
+        SteamNetworkingMicroseconds m_usecNetworkChangeGenerationChangedAt = 0;
+
         // Bitmask of kSTUNPacketEncodingFlags_* controlling STUN wire format quirks:
         // whether to include a fingerprint, whether to use legacy MappedAddress vs
         // XOR-MappedAddress, and whether to sign with HMAC-SHA1 (MessageIntegrity)

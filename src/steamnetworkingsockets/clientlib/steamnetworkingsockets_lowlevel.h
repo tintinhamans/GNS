@@ -347,17 +347,37 @@ extern bool IsRouteToAddressProbablyLocal( netadr_t addr );
 
 extern bool ResolveHostname( const char* pszHostname, CUtlVector< SteamNetworkingIPAddr > *pAddrs );
 
+/// Returns a counter that increments on every OS network configuration change, ICE sessions poll it
+/// to regather. Always 0 outside Windows, where it is not implemented.
+extern uint32 GetNetworkChangeGeneration();
+
 #ifdef STEAMNETWORKINGSOCKETS_ENABLE_ICE
 /// Wait for ICE STUN/TURN hostname lookups that are still running.
 extern void JoinICEDNSThreads();
 #endif
 
+// Ranks local interfaces, higher is better. Virtual adapters rank lowest but are never dropped, players use VPNs.
+enum EICEAdapterKind
+{
+	k_EICEAdapterKind_Unknown = -1,        // No metadata, e.g. POSIX. Never mixed with real values in one call
+	k_EICEAdapterKind_Virtual = 0,         // VPN, tunnel, or other virtual/software adapter
+	k_EICEAdapterKind_OtherPhysical = 1,   // Cellular, PPP or other unrecognized physical adapter
+	k_EICEAdapterKind_WiFi = 2,
+	k_EICEAdapterKind_Ethernet = 3,
+};
+
 struct LocalAddress_t
 {
 	SteamNetworkingIPAddr m_addr;
 	int m_nPrefixLen; // Subnet prefix length, e.g. 24 for a /24.  0 if unavailable or bogus.
+
+	// Ranking metadata, only populated on Windows. The defaults leave the order unchanged.
+	bool m_bDefaultRoute = false;                                // True if this adapter currently carries the OS default route for this address's family
+	int m_nAdapterKind = k_EICEAdapterKind_Unknown;              // EICEAdapterKind
 };
-extern bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs );
+// pAllAssignedAddrs, if set, gets every address still assigned, even ones pAddrs left out, such as a
+// deprecated IPv6 privacy address. A regather does not tear down an interface that still works.
+extern bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs, CUtlVector<SteamNetworkingIPAddr> *pAllAssignedAddrs = nullptr );
 
 /////////////////////////////////////////////////////////////////////////////
 //

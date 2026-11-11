@@ -3848,6 +3848,10 @@ bool BSteamNetworkingSocketsLowLevelAddRef( SteamNetworkingErrMsg &errMsg )
 	return true;
 }
 
+#if IsWindows()
+static void NetworkChangeNotifyShutdown();
+#endif
+
 void SteamNetworkingSocketsLowLevelDecRef()
 {
 	SteamNetworkingGlobalLock::AssertHeldByCurrentThread();
@@ -3872,6 +3876,10 @@ void SteamNetworkingSocketsLowLevelDecRef()
 
 	#ifdef STEAMNETWORKINGSOCKETS_ENABLE_ICE
 		JoinICEDNSThreads();
+	#endif
+
+	#if IsWindows()
+		NetworkChangeNotifyShutdown();
 	#endif
 
 	// Destory wake communication objects
@@ -4122,7 +4130,131 @@ static int IPv6MaskToPrefixLen( const uint8 *pMask )
 	return n; // 0 means all-zero mask, which is bogus
 }
 
-bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
+#if IsWindows()
+
+static std::atomic<uint32> s_nNetworkChangeGeneration{ 0 };
+
+// Returns the interface carrying the default route toward a public address, or 0 if unknown.
+static NET_IFINDEX GetDefaultRouteIfIndex( bool bIPv6 )
+{
+	typedef DWORD (WINAPI *FnGetBestInterfaceEx)( struct sockaddr *pDestAddr, PDWORD pdwBestIfIndex );
+	static HMODULE hModule = LoadLibraryA( "Iphlpapi.dll" );
+	static FnGetBestInterfaceEx pGetBestInterfaceEx = hModule ? (FnGetBestInterfaceEx)GetProcAddress( hModule, "GetBestInterfaceEx" ) : nullptr;
+	if ( !pGetBestInterfaceEx )
+		return 0;
+
+	netadr_t probe;
+	if ( bIPv6 )
+	{
+		// 2001:4860:4860::8888, Google public DNS
+		static const byte pubV6[16] = { 0x20,0x01,0x48,0x60,0x48,0x60,0,0,0,0,0,0,0,0,0x88,0x88 };
+		probe.SetIPV6( pubV6, 0 );
+	}
+	else
+	{
+		probe.SetIPv4( 8, 8, 8, 8 ); // Google public DNS
+	}
+
+	sockaddr_storage sockaddrDest;
+	probe.ToSockadr( &sockaddrDest );
+
+	NET_IFINDEX dwBestIfIndex = 0;
+	DWORD r = (*pGetBestInterfaceEx)( (sockaddr *)&sockaddrDest, &dwBestIfIndex );
+	if ( r != NO_ERROR )
+		return 0;
+	return dwBestIfIndex;
+}
+
+// Case-insensitive substring search, to avoid pulling in shlwapi just for StrStrIW.
+static bool WStrContainsCI( const wchar_t *pszHaystack, const wchar_t *pszNeedle )
+{
+	if ( pszHaystack == nullptr || pszNeedle == nullptr || *pszNeedle == L'\0' )
+		return false;
+	size_t cchNeedle = wcslen( pszNeedle );
+	for ( const wchar_t *p = pszHaystack; *p != L'\0'; ++p )
+	{
+		if ( _wcsnicmp( p, pszNeedle, cchNeedle ) == 0 )
+			return true;
+	}
+	return false;
+}
+
+// Returns the adapter kind used for ranking. Virtual adapters are never dropped, players connect over them.
+static int ClassifyAdapterKind( const IP_ADAPTER_ADDRESSES_LH *pAdapter )
+{
+	if ( pAdapter->IfType == IF_TYPE_TUNNEL || pAdapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK || pAdapter->TunnelType != TUNNEL_TYPE_NONE )
+		return k_EICEAdapterKind_Virtual;
+
+	// Many VPN and virtual adapters report themselves as ethernet, so the description is checked too.
+	if ( pAdapter->Description != nullptr )
+	{
+		static const wchar_t * const s_pszVirtualHints[] =
+		{
+			L"VPN", L"TAP-", L"Tunnel", L"Virtual", L"Hamachi", L"ZeroTier", L"WireGuard", L"Hyper-V", L"VMware", L"VirtualBox", L"Loopback",
+		};
+		for ( const wchar_t *pszHint : s_pszVirtualHints )
+		{
+			if ( WStrContainsCI( pAdapter->Description, pszHint ) )
+				return k_EICEAdapterKind_Virtual;
+		}
+	}
+
+	switch ( pAdapter->IfType )
+	{
+		case IF_TYPE_ETHERNET_CSMACD: return k_EICEAdapterKind_Ethernet;
+		case IF_TYPE_IEEE80211:       return k_EICEAdapterKind_WiFi;
+		default:                      return k_EICEAdapterKind_OtherPhysical;
+	}
+}
+
+// Only bumps a counter, each ICE session regathers on its own thread when it next thinks.
+static VOID WINAPI NetworkChangeNotifyCallback( PVOID, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE )
+{
+	s_nNetworkChangeGeneration.fetch_add( 1, std::memory_order_relaxed );
+}
+
+static std::mutex s_mutexNetworkChangeNotify;
+static std::atomic<bool> s_bNetworkChangeNotifyRegistered{ false };
+static HANDLE s_hNetworkChangeNotify = nullptr;
+
+static void EnsureNetworkChangeNotifyRegistered()
+{
+	std::lock_guard<std::mutex> lock( s_mutexNetworkChangeNotify );
+	if ( s_bNetworkChangeNotifyRegistered.load( std::memory_order_relaxed ) )
+		return;
+
+	// Registered once per library lifetime, and only tried once even if it fails.
+	NotifyIpInterfaceChange( AF_UNSPEC, NetworkChangeNotifyCallback, nullptr, FALSE, &s_hNetworkChangeNotify );
+	s_bNetworkChangeNotifyRegistered.store( true, std::memory_order_release );
+}
+
+// The callback points into this library, so it must be gone before the library can be.
+// CancelMibChangeNotify2 returns only once no callback is still running.
+static void NetworkChangeNotifyShutdown()
+{
+	std::lock_guard<std::mutex> lock( s_mutexNetworkChangeNotify );
+	if ( s_hNetworkChangeNotify != nullptr )
+	{
+		CancelMibChangeNotify2( s_hNetworkChangeNotify );
+		s_hNetworkChangeNotify = nullptr;
+	}
+	s_bNetworkChangeNotifyRegistered.store( false, std::memory_order_release );
+}
+
+#endif // IsWindows()
+
+uint32 GetNetworkChangeGeneration()
+{
+	#if IsWindows()
+		if ( !s_bNetworkChangeNotifyRegistered.load( std::memory_order_acquire ) )
+			EnsureNetworkChangeNotifyRegistered();
+		return s_nNetworkChangeGeneration.load( std::memory_order_relaxed );
+	#else
+		return 0;
+	#endif
+}
+
+bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs, CUtlVector<SteamNetworkingIPAddr> *pAllAssignedAddrs )
 {
 
 	#if STEAMNETWORKINGSOCKETS_ENABLE_MOCK
@@ -4146,6 +4278,8 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
 					else
 						entry.m_nPrefixLen = 112;
 				}
+				if ( pAllAssignedAddrs != nullptr )
+					pAllAssignedAddrs->AddToTail( iface.m_ip );
 			}
 		}
 		return true;
@@ -4192,14 +4326,35 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
         return false;
     }
 
+    const NET_IFINDEX dwDefaultRouteIfIndexV4 = GetDefaultRouteIfIndex( false );
+    const NET_IFINDEX dwDefaultRouteIfIndexV6 = GetDefaultRouteIfIndex( true );
+
     for( PIP_ADAPTER_ADDRESSES_LH pThisInfo = pAddrInfo; pThisInfo != nullptr; pThisInfo = pThisInfo->Next )
     {
+        // Only clearly unusable adapters are skipped, some VPN and virtual drivers never report Up.
+        if ( pThisInfo->OperStatus == IfOperStatusDown
+            || pThisInfo->OperStatus == IfOperStatusNotPresent
+            || pThisInfo->OperStatus == IfOperStatusLowerLayerDown )
+            continue;
+
+        const int nAdapterKind = ClassifyAdapterKind( pThisInfo );
+        const bool bDefaultRouteV4 = ( dwDefaultRouteIfIndexV4 != 0 && pThisInfo->IfIndex == dwDefaultRouteIfIndexV4 );
+        const bool bDefaultRouteV6 = ( dwDefaultRouteIfIndexV6 != 0 && pThisInfo->Ipv6IfIndex == dwDefaultRouteIfIndexV6 );
+
+        // An adapter can carry many IPv6 addresses for privacy or renumbering, each costing STUN and TURN work.
+        // Keep the best global and the best ULA address and add at most one of them, preferring global.
+        bool bHaveGlobalV6 = false, bGlobalV6Stable = false;
+        SteamNetworkingIPAddr bestGlobalV6; int nBestGlobalV6PrefixLen = 0;
+        bool bHaveULAV6 = false, bULAV6Stable = false;
+        SteamNetworkingIPAddr bestULAV6; int nBestULAV6PrefixLen = 0;
+
         for ( PIP_ADAPTER_UNICAST_ADDRESS_LH pThisAddr = pThisInfo->FirstUnicastAddress; pThisAddr != nullptr; pThisAddr = pThisAddr->Next )
         {
             if ( pThisAddr->Address.lpSockaddr == nullptr )
                 continue;
 
             SteamNetworkingIPAddr ipAddr;
+            bool bIsV6 = false;
             if ( pThisAddr->Address.lpSockaddr->sa_family == AF_INET )
             {
                 sockaddr_in* pAddrIN = ( sockaddr_in* )( pThisAddr->Address.lpSockaddr );
@@ -4209,6 +4364,7 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
             {
                 sockaddr_in6* pAddrIN6 = ( sockaddr_in6* )( pThisAddr->Address.lpSockaddr );
                 ipAddr.SetIPv6( pAddrIN6->sin6_addr.u.Byte, pAddrIN6->sin6_port );
+                bIsV6 = true;
             }
             else
             {
@@ -4219,10 +4375,60 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
 			if ( GetLocalAddresses_IsReserved( ipAddr ) )
 				continue;
 
-            // Got a host address, record it!
+			// The address is still assigned even if it loses the one-per-adapter pick below, so a regather keeps
+			// an interface using it. Only DAD-failed addresses are truly gone.
+			if ( pAllAssignedAddrs != nullptr && ( !bIsV6 || pThisAddr->DadState != IpDadStateDuplicate ) )
+				pAllAssignedAddrs->AddToTail( ipAddr );
+
+			if ( bIsV6 )
+			{
+				// Skip anything not fully usable, whether tentative, duplicate or deprecated.
+				if ( pThisAddr->DadState != IpDadStatePreferred )
+					continue;
+
+				// Prefer a stable address over a temporary one, which can rotate out mid-connection.
+				const bool bStable = ( pThisAddr->SuffixOrigin != IpSuffixOriginRandom );
+				const bool bULA = ( ipAddr.m_ipv6[0] & 0xfe ) == 0xfc; // fc00::/7
+
+				if ( bULA )
+				{
+					if ( !bHaveULAV6 || ( bStable && !bULAV6Stable ) )
+					{
+						bestULAV6 = ipAddr;
+						nBestULAV6PrefixLen = pThisAddr->OnLinkPrefixLength;
+						bULAV6Stable = bStable;
+						bHaveULAV6 = true;
+					}
+				}
+				else
+				{
+					if ( !bHaveGlobalV6 || ( bStable && !bGlobalV6Stable ) )
+					{
+						bestGlobalV6 = ipAddr;
+						nBestGlobalV6PrefixLen = pThisAddr->OnLinkPrefixLength;
+						bGlobalV6Stable = bStable;
+						bHaveGlobalV6 = true;
+					}
+				}
+				continue;
+			}
+
+            // Got an IPv4 host address, record it!
 			LocalAddress_t &entry = *pAddrs->AddToTailGetPtr();
 			entry.m_addr = ipAddr;
 			entry.m_nPrefixLen = pThisAddr->OnLinkPrefixLength; // UINT8; 0 is bogus for a unicast addr
+			entry.m_nAdapterKind = nAdapterKind;
+			entry.m_bDefaultRoute = bDefaultRouteV4;
+        }
+
+        // At most one IPv6 address per adapter, the best global one or else a ULA. ZeroTier only hands out ULAs.
+        if ( bHaveGlobalV6 || bHaveULAV6 )
+        {
+			LocalAddress_t &entry = *pAddrs->AddToTailGetPtr();
+			entry.m_addr = bHaveGlobalV6 ? bestGlobalV6 : bestULAV6;
+			entry.m_nPrefixLen = bHaveGlobalV6 ? nBestGlobalV6PrefixLen : nBestULAV6PrefixLen;
+			entry.m_nAdapterKind = nAdapterKind;
+			entry.m_bDefaultRoute = bDefaultRouteV6;
         }
     }
 
@@ -4261,6 +4467,9 @@ bool GetLocalAddresses( CUtlVector<LocalAddress_t> *pAddrs )
 		// Discard certain reserved addresses
 		if ( GetLocalAddresses_IsReserved( ipAddr ) )
 			continue;
+
+		if ( pAllAssignedAddrs != nullptr )
+			pAllAssignedAddrs->AddToTail( ipAddr );
 
 		// Got a host address, record it!
 		LocalAddress_t &entry = *pAddrs->AddToTailGetPtr();
