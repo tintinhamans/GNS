@@ -12,6 +12,10 @@
 #include "crypto.h"
 #include "steamnetworkingsockets_mock.h"
 
+#include <atomic>
+#include <mutex>
+#include <thread>
+
 // Put everything in a namespace, so we don't violate the one definition rule
 namespace SteamNetworkingSocketsLib {
 
@@ -1174,6 +1178,176 @@ bool ICESessionInterface::SendPacketGather( int nChunks, const iovec *pChunks, i
 // CSteamNetworkingICESession
 //
 /////////////////////////////////////////////////////////////////////////////
+
+struct ICEServerEntry
+{
+	bool m_bIsTURN = false;
+	std::string m_strHost;
+	std::string m_strUsername;
+	std::string m_strPassword;
+	std_vector< netadr_t > m_vecAddrs;
+};
+
+struct ICEDNSResolveState
+{
+	std::mutex m_mutex;
+	std_vector< ICEServerEntry > m_vecResolved; // Handed over by the worker as each lookup completes
+	std::atomic<bool> m_bDone{ false };         // Set after the last entry is in m_vecResolved
+};
+
+using ICEDNSThreads = std_vector< std::pair< std::thread, std::shared_ptr<ICEDNSResolveState> > >;
+
+// Leaked on purpose: joinable threads would terminate at exit.
+static std::mutex s_mutexDNSThreads;
+static ICEDNSThreads &s_vecDNSThreads = *new ICEDNSThreads;
+
+static void AddICEDNSThread( std::thread thread, std::shared_ptr<ICEDNSResolveState> pState )
+{
+	std::lock_guard<std::mutex> lock( s_mutexDNSThreads );
+	for ( auto it = s_vecDNSThreads.begin(); it != s_vecDNSThreads.end(); )
+	{
+		if ( it->second->m_bDone )
+		{
+			it->first.join();
+			it = s_vecDNSThreads.erase( it );
+		}
+		else
+		{
+			++it;
+		}
+	}
+	s_vecDNSThreads.emplace_back( std::move( thread ), std::move( pState ) );
+}
+
+// Lookups cannot be cancelled, so this blocks until any in flight return.
+void JoinICEDNSThreads()
+{
+	ICEDNSThreads vecThreads;
+	{
+		std::lock_guard<std::mutex> lock( s_mutexDNSThreads );
+		vecThreads.swap( s_vecDNSThreads );
+	}
+	for ( auto &thread : vecThreads )
+		thread.first.join();
+}
+
+static void ResolveServerEntry( ICEServerEntry &entry )
+{
+	CUtlVector< SteamNetworkingIPAddr > vecResolved;
+	ResolveHostname( entry.m_strHost.c_str(), &vecResolved );
+	for ( const SteamNetworkingIPAddr &ip : vecResolved )
+	{
+		netadr_t adr;
+		SteamNetworkingIPAddrToNetAdr( adr, ip );
+		entry.m_vecAddrs.push_back( adr );
+	}
+}
+
+// Entries are handed over one at a time in configured order, so a slow lookup does not hold back
+// earlier servers. A host listed more than once is looked up once.
+static void RunICEDNSResolveWorker( std::shared_ptr<ICEDNSResolveState> pState, std_vector< ICEServerEntry > vecEntries )
+{
+	struct LookedUpHost
+	{
+		std::string m_strHost; // without the port
+		std_vector< netadr_t > m_vecAddrs;
+	};
+	std_vector< LookedUpHost > vecLookedUp;
+
+	for ( ICEServerEntry &entry : vecEntries )
+	{
+		std::string strHost = entry.m_strHost;
+		uint16 nPort = 0;
+		const size_t nColon = strHost.find( ':' );
+		if ( nColon != std::string::npos )
+		{
+			nPort = (uint16)atoi( strHost.c_str() + nColon + 1 );
+			strHost.resize( nColon );
+		}
+
+		bool bCached = false;
+		for ( const LookedUpHost &prev : vecLookedUp )
+		{
+			if ( prev.m_strHost == strHost )
+			{
+				entry.m_vecAddrs = prev.m_vecAddrs;
+				for ( netadr_t &adr : entry.m_vecAddrs )
+					adr.SetPort( nPort );
+				bCached = true;
+				break;
+			}
+		}
+		if ( !bCached )
+		{
+			ResolveServerEntry( entry );
+			vecLookedUp.push_back( { strHost, entry.m_vecAddrs } );
+		}
+
+		std::lock_guard<std::mutex> lock( pState->m_mutex );
+		pState->m_vecResolved.push_back( std::move( entry ) );
+	}
+	pState->m_bDone = true;
+}
+
+void CSteamNetworkingICESession::AddServers( std_vector< ICEServerEntry > &vecEntries )
+{
+	const bool bHadTURNServerLANAddress = m_bAnyTURNServerLANAddress;
+	for ( const ICEServerEntry &entry : vecEntries )
+	{
+		for ( const netadr_t &adr : entry.m_vecAddrs )
+		{
+			if ( !entry.m_bIsTURN )
+			{
+				// Skip duplicates, so a dead server listed twice is only tried once.
+				if ( index_of( m_vecSTUNServers, adr ) < 0 )
+					m_vecSTUNServers.push_back( adr );
+				continue;
+			}
+
+			// Skip duplicates, keeping the first entry's credentials.  Credentials
+			// are looked up by address, so a later duplicate could never use its own.
+			if ( index_of( m_vecTURNServers, adr ) >= 0 )
+				continue;
+			m_vecTURNServers.push_back( adr );
+			TURNCredentials cred;
+			cred.m_strUsername = entry.m_strUsername;
+			cred.m_strPassword = entry.m_strPassword;
+			m_vecTURNCredentials.push_back( std::move( cred ) );
+
+			if ( ClassifyIP( adr ) & k_nIPClassify_LAN )
+				m_bAnyTURNServerLANAddress = true;
+		}
+	}
+
+	// Peer candidates received while the lookups were pending missed the LAN check.
+	if ( m_bAnyTURNServerLANAddress && !bHadTURNServerLANAddress )
+	{
+		for ( const ICEPeerCandidate &c : m_vecPeerCandidates )
+			RegisterTURNPermission( static_cast< const CIPAddress &>(c.m_addr) );
+	}
+}
+
+// Discovery skips empty server lists until the lookups finish.
+void CSteamNetworkingICESession::Think_ApplyPendingDNSResults()
+{
+	if ( !m_pDNSResolveState )
+		return;
+
+	// Read the done flag before taking the entries, an entry pushed after the swap stays queued
+	// and the flag is only set after the last push.
+	const bool bDone = m_pDNSResolveState->m_bDone;
+	std_vector< ICEServerEntry > vecEntries;
+	{
+		std::lock_guard<std::mutex> lock( m_pDNSResolveState->m_mutex );
+		vecEntries.swap( m_pDNSResolveState->m_vecResolved );
+	}
+	if ( bDone )
+		m_pDNSResolveState.reset();
+
+	if ( !vecEntries.empty() )
+		AddServers( vecEntries );
+}
+
 CSteamNetworkingICESession::CSteamNetworkingICESession( EICERole role, CSteamNetworkingICESessionCallbacks *pCallbacks, int nEncoding )
 {
     m_nEncoding = nEncoding;
@@ -1198,25 +1372,35 @@ CSteamNetworkingICESession::CSteamNetworkingICESession( const ICESessionConfig& 
 
 	m_vecSTUNServers.reserve( cfg.m_nStunServers );
 
+	// Hostnames resolve in a background lookup, so DNS never blocks under the global lock.
+	std_vector< ICEServerEntry > vecLiteralEntries;
+	std_vector< ICEServerEntry > vecHostnameEntries;
+	auto AddEntry = [&]( bool bIsTURN, const char *pszHost, const char *pszUsername, const char *pszPassword )
 	{
-		for ( int i = 0; i < cfg.m_nStunServers; ++i )
-		{
-			const char *pszHostname = cfg.m_pStunServers[i];
-			if ( V_strnicmp( pszHostname, "stun:", 5 ) == 0 )
-				pszHostname = pszHostname + 5;
-			CUtlVector< SteamNetworkingIPAddr > stunServers;
-			ResolveHostname( pszHostname, &stunServers );
-			m_vecSTUNServers.reserve( m_vecSTUNServers.size() + stunServers.Count() );
-			for ( const SteamNetworkingIPAddr &ip: stunServers )
-			{
-				netadr_t adr;
-				SteamNetworkingIPAddrToNetAdr( adr, ip );
+		ICEServerEntry entry;
+		entry.m_bIsTURN = bIsTURN;
+		entry.m_strHost = pszHost;
+		entry.m_strUsername = pszUsername;
+		entry.m_strPassword = pszPassword;
 
-				// Skip duplicates, so a dead server listed twice is only tried once.
-				if ( index_of( m_vecSTUNServers, adr ) < 0 )
-					m_vecSTUNServers.push_back( adr );
-			}
+		SteamNetworkingIPAddr addr;
+		if ( addr.ParseString( pszHost ) )
+		{
+			ResolveServerEntry( entry );
+			vecLiteralEntries.push_back( std::move( entry ) );
 		}
+		else
+		{
+			vecHostnameEntries.push_back( std::move( entry ) );
+		}
+	};
+
+	for ( int i = 0; i < cfg.m_nStunServers; ++i )
+	{
+		const char *pszHostname = cfg.m_pStunServers[i];
+		if ( V_strnicmp( pszHostname, "stun:", 5 ) == 0 )
+			pszHostname = pszHostname + 5;
+		AddEntry( false, pszHostname, "", "" );
 	}
 
 	m_vecTURNServers.reserve( cfg.m_nTurnServers );
@@ -1230,34 +1414,15 @@ CSteamNetworkingICESession::CSteamNetworkingICESession( const ICESessionConfig& 
 		const char *pszPassword = cfg.m_pTurnServers[i].m_pszPwd     ? cfg.m_pTurnServers[i].m_pszPwd     : "";
 		if ( V_strnicmp( pszHostname, "turn:", 5 ) == 0 )
 			pszHostname = pszHostname + 5;
-		CUtlVector< SteamNetworkingIPAddr > turnServers;
-		ResolveHostname( pszHostname, &turnServers );
-		m_vecTURNServers.reserve( m_vecTURNServers.size() + turnServers.Count() );
-		m_vecTURNCredentials.reserve( m_vecTURNCredentials.size() + turnServers.Count() );
-		for ( const SteamNetworkingIPAddr &ip: turnServers )
-		{
-			netadr_t adr;
-			SteamNetworkingIPAddrToNetAdr( adr, ip );
-
-			// Skip duplicates, keeping the first entry's credentials.  Credentials
-			// are looked up by address, so a later duplicate could never use its own.
-			if ( index_of( m_vecTURNServers, adr ) >= 0 )
-				continue;
-			m_vecTURNServers.push_back( adr );
-			TURNCredentials cred;
-			cred.m_strUsername = pszUsername;
-			cred.m_strPassword = pszPassword;
-			m_vecTURNCredentials.push_back( std::move( cred ) );
-		}
+		AddEntry( true, pszHostname, pszUsername, pszPassword );
 	}
 
-	for ( const netadr_t &srv : m_vecTURNServers )
+	if ( !vecLiteralEntries.empty() )
+		AddServers( vecLiteralEntries );
+	if ( !vecHostnameEntries.empty() )
 	{
-		if ( ClassifyIP( srv ) & k_nIPClassify_LAN )
-		{
-			m_bAnyTURNServerLANAddress = true;
-			break;
-		}
+		m_pDNSResolveState = std::make_shared<ICEDNSResolveState>();
+		AddICEDNSThread( std::thread( RunICEDNSResolveWorker, m_pDNSResolveState, std::move( vecHostnameEntries ) ), m_pDNSResolveState );
 	}
 
 	m_nPermittedCandidateTypes = cfg.m_nCandidateTypes;
@@ -1321,6 +1486,38 @@ void CSteamNetworkingICESession::SetRemotePassword( const char *pszPassword )
     SetNextThinkTimeASAP();
 }
 
+void CSteamNetworkingICESession::RegisterTURNPermission( const CIPAddress &permIP )
+{
+	// Register the peer IP for TURN CreatePermission so our relay will forward
+	// traffic from it.  Normally we only do this for public IPs, because that is the only
+	// type of address that a real TURN server shoud ever care about.
+	// But this is really just an optimization.  If we have a TURN server running
+	// on a LAN port, go ahead and add all remote IPs to the permissions list and
+	// bypass this optimization.
+	int nPermClassify = ClassifyIP( permIP );
+	if ( ( nPermClassify & k_nIPClassify_Public ) ||
+	     ( m_bAnyTURNServerLANAddress && !( nPermClassify & k_nIPClassify_Localhost ) && nPermClassify != 0 ) )
+	{
+		bool bIsIPv4 = permIP.GetType() == k_EIPTypeV4;
+		std_vector<CIPAddress> &vecPermitted = bIsIPv4 ? m_vecTURNPermittedIPv4 : m_vecTURNPermittedIPv6;
+		int &nRevision = bIsIPv4 ? m_nTURNPermissionRevisionIPv4 : m_nTURNPermissionRevisionIPv6;
+		bool bAlreadyPermitted = false;
+		for ( const CIPAddress &existing : vecPermitted )
+		{
+			if ( existing == permIP )
+			{
+				bAlreadyPermitted = true;
+				break;
+			}
+		}
+		if ( !bAlreadyPermitted )
+		{
+			vecPermitted.push_back( permIP );
+			++nRevision;
+		}
+	}
+}
+
 EICECandidateType CSteamNetworkingICESession::AddPeerCandidate( const RFC5245CandidateAttr& attr )
 {
 	SteamNetworkingGlobalLock::AssertHeldByCurrentThread();
@@ -1367,35 +1564,7 @@ EICECandidateType CSteamNetworkingICESession::AddPeerCandidate( const RFC5245Can
 	{
 		m_vecPeerCandidates.push_back( ICEPeerCandidate( candidate, pszFoundation ) );
 
-		// Register the peer IP for TURN CreatePermission so our relay will forward
-		// traffic from it.  Normally we only do this for public IPs, because that is the only
-        // type of address that a real TURN server shoud ever care about.
-        // But this is really just an optimization.  If we have a TURN server running
-        // on a LAN port, go ahead and add all remote IPs to the permissions list and
-        // bypass this optimization.
-		const CIPAddress &permIP = static_cast< const CIPAddress &>(candidate.m_addr);
-		int nPermClassify = ClassifyIP( permIP );
-		if ( ( nPermClassify & k_nIPClassify_Public ) ||
-		     ( m_bAnyTURNServerLANAddress && !( nPermClassify & k_nIPClassify_Localhost ) && nPermClassify != 0 ) )
-		{
-			bool bIsIPv4 = permIP.GetType() == k_EIPTypeV4;
-			std_vector<CIPAddress> &vecPermitted = bIsIPv4 ? m_vecTURNPermittedIPv4 : m_vecTURNPermittedIPv6;
-			int &nRevision = bIsIPv4 ? m_nTURNPermissionRevisionIPv4 : m_nTURNPermissionRevisionIPv6;
-			bool bAlreadyPermitted = false;
-			for ( const CIPAddress &existing : vecPermitted )
-			{
-				if ( existing == permIP )
-				{
-					bAlreadyPermitted = true;
-					break;
-				}
-			}
-			if ( !bAlreadyPermitted )
-			{
-				vecPermitted.push_back( permIP );
-				++nRevision;
-			}
-		}
+		RegisterTURNPermission( static_cast< const CIPAddress &>(candidate.m_addr) );
 	}
     m_bCandidatePairsNeedUpdate = true;
     SetNextThinkTimeASAP();
@@ -1931,6 +2100,8 @@ void CSteamNetworkingICESession::Think( SteamNetworkingMicroseconds usecNow )
 	SteamNetworkingGlobalLock::AssertHeldByCurrentThread( "CSteamNetworkingICESession::Think" );
 
     SetNextThinkTime( usecNow + SteamNetworkingMicroseconds( 50000 ) ); // 50ms think rate
+
+    Think_ApplyPendingDNSResults();
 
     if ( m_bInterfaceListStale )
     {
