@@ -2,8 +2,8 @@
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO tintinhamans/GNS
-    REF "d2837fac6aa4329f96887b71929e6799e9bcc1ac" # gameclient: v1.6.1 + ICE fixes
-    SHA512 ef7036fc93ce9aae7c2138e5f455d50410e33ab61369e31ae4f54e6bb442dbb95b818c8c18a576c787e717adb5ae6d4084c89f48cd45778365f6cf0571883b2c
+    REF "c4ca2ee7ed9a208e686f20fbc41bd1ae010a864c" # gameclient: v1.6.1 + ICE fixes, #472, #470
+    SHA512 9787aff3d0d79601965e7fc7960cbbf33a81ce14590c0b4952660742bda6cf2fe8d75c5264ee31297f620d7653f3f194adcd86cb39e517bfa032c1517eec2265
     HEAD_REF gameclient
 )
 
