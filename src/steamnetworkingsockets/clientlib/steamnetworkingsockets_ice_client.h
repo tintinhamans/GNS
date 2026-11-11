@@ -402,6 +402,21 @@ namespace SteamNetworkingSocketsLib {
             ICEPeerCandidate m_remoteCandidate;
             CSteamNetworkingSocketsSTUNRequest *m_pPeerRequest;
 			int m_nLastRecordedPing;
+
+            // Next consent check on the selected pair or liveness check on a backup. Zero until the next ping
+            // pass seeds it, since a pair only gets here right after a check proved it alive.
+            SteamNetworkingMicroseconds m_usecNextPeriodicCheck;
+
+            // Last inbound packet on this exact tuple, a check reply or data on the selected pair.
+            // Judges whether the selected pair is dead and ranks backups by freshness.
+            SteamNetworkingMicroseconds m_usecLastRecv;
+
+            // Failed checks in a row. One lost response does not fail over, several do.
+            int m_nConsecutiveFailedChecks;
+
+            // Successful checks in a row, a pair must pass a couple before it wins back a working selection.
+            int m_nConsecutiveSuccessfulChecks;
+
             ICECandidatePair( const ICELocalCandidate& localCandidate, const ICEPeerCandidate& remoteCandidate, EICERole role );
 
             // Route-selection preference: prefer a same-subnet (direct LAN) pair, then higher
@@ -490,6 +505,14 @@ namespace SteamNetworkingSocketsLib {
         // in that pair, kept here to avoid the per-send lookup overhead.
         ICECandidatePair *m_pSelectedCandidatePair;
 
+        // The only pair besides the selection with m_bNominated, waiting for its own check to replace it
+        // after a failover, win-back, bootstrap or peer USE-CANDIDATE. The selection stays alive until then.
+        ICECandidatePair *m_pPendingNomination = nullptr;
+
+        // Last failure-driven failover, not the initial selection or an upgrade. Win-back waits a dwell after
+        // it so close-priority paths cannot flap, and zero never delays an early relay->direct upgrade.
+        SteamNetworkingMicroseconds m_usecLastFailoverTime = 0;
+
         // Local network interfaces discovered during the most recent enumeration.
         // Each entry represents one usable local address.  Rebuilt whenever
         // m_bInterfaceListStale is set.
@@ -574,12 +597,32 @@ namespace SteamNetworkingSocketsLib {
         void FailOverRelay( ICESessionInterface *pIntf );
         void Think_TestPeerConnectivity();
 
+        // RFC 7675 consent checks on the selected pair and liveness pings on backups, at WebRTC's default cadence.
+        void Think_PingSelectedAndBackupPairs( SteamNetworkingMicroseconds usecNow );
+
         // Returns true once every interface finished gathering, no DNS is pending and every pair failed, with
         // no peer candidate activity for the grace period. Never true while a working pair is still possible.
         bool BAllCandidatesExhausted( SteamNetworkingMicroseconds usecNow ) const;
         void Think_CheckAllCandidatesFailed( SteamNetworkingMicroseconds usecNow );
 
         void SetSelectedCandidatePair( ICECandidatePair *pPair );
+
+        // Returns the best Succeeded pair other than pExclude in nomination order, skipping stale ones, or null.
+        ICECandidatePair *FindBestSucceededCandidatePair( const ICECandidatePair *pExclude, SteamNetworkingMicroseconds usecNow ) const;
+
+        // Arms the best eligible backup other than pDeadPair. With none left the selected pair keeps retrying.
+        void TryNominateNextFailoverBackup( ICECandidatePair *pDeadPair, SteamNetworkingMicroseconds usecNow );
+
+        // Makes pTarget the only pending nomination, other pairs except the selection lose m_bNominated.
+        void MarkPendingNomination( ICECandidatePair *pTarget );
+
+        // Makes pTarget the pending nomination with a fresh nominated check. Does nothing if the old pending
+        // check is already on the wire, so two nominations are never in flight.
+        void ArmNomination( ICECandidatePair *pTarget );
+
+        // Drops the pending nomination unless its check was already sent, since the peer may have switched
+        // to it. Returns false only when it was left alone for that reason.
+        bool CancelPendingNomination();
 
         // Delete a candidate pair and perform all associated cleanup:
         // clears the selected-pair state if this was the active path, cancels
